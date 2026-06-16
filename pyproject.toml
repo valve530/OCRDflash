@@ -1,12 +1,35 @@
 [project]
 name = "ocr-dflash"
 version = "0.1.0"
-description = "Add your description here"
+description = "PDF-native draft-guided VLM acceleration research pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "accelerate>=1.14.0",
+    "paddleocr>=3.7.0",
+    "paddlepaddle>=3.3.1",
+    "pillow>=10.4.0",
+    "pymupdf>=1.24.10",
+    "sentencepiece>=0.2.1",
     "torch>=2.11.0",
+    "torchvision>=0.26.0",
+    "transformers>=4.45.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[project.scripts]
+ocr-dflash = "ocr_dflash.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ocr_dflash"]
 
 [[tool.uv.index]]
 name = "pytorch-cu128"

@@ -1,5 +1,4 @@
-def main():
-    print("Hello from ocr-dflash!")
+from ocr_dflash.cli import main
 
 
 if __name__ == "__main__":
