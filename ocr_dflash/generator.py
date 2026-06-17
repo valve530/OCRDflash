@@ -259,9 +259,9 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
             output_ids = self._generate(inputs, options)
             generated_ids = _trim_prompt_ids(output_ids, inputs)
 
-        text = _decode_generated(self.processor, generated_ids, generated_ids)
-        tokens = int(generated_ids.shape[-1]) if hasattr(generated_ids, "shape") else len(tokenize_text(self.tokenizer, text))
         backend = "paddleocr-vl:generate"
+        text: str
+        tokens: int
         if stats is not None:
             if stats.accepted:
                 backend = "paddleocr-vl:dflash:accepted"
@@ -269,9 +269,15 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
                 tokens = stats.accepted_tokens
             elif stats.prefix_accepted:
                 backend = "paddleocr-vl:dflash:prefix"
+                text = _decode_generated(self.processor, generated_ids, generated_ids)
                 tokens = stats.accepted_tokens + stats.generated_tokens
             else:
                 backend = "paddleocr-vl:dflash:fallback-generate"
+                text = _decode_generated(self.processor, generated_ids, generated_ids)
+                tokens = int(generated_ids.shape[-1]) if hasattr(generated_ids, "shape") else len(tokenize_text(self.tokenizer, text))
+        else:
+            text = _decode_generated(self.processor, generated_ids, generated_ids)
+            tokens = int(generated_ids.shape[-1]) if hasattr(generated_ids, "shape") else len(tokenize_text(self.tokenizer, text))
 
         return BlockRecognition(
             backend=backend,
@@ -287,11 +293,98 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         draft: str,
         options: GenerationOptions,
     ):
-        import torch
-
         draft_ids = _tokenize_draft(self.tokenizer, draft)
         if not draft_ids:
             return None, self._generate(inputs, options)
+
+        try:
+            return self._generate_with_dflash_cache(inputs, draft_ids, options)
+        except (AttributeError, TypeError, RuntimeError) as exc:
+            if not _should_fallback_from_cache_error(exc):
+                raise
+            return self._generate_with_dflash_recompute(inputs, draft_ids, options)
+
+    def _generate_with_dflash_cache(
+        self,
+        inputs: dict[str, object],
+        draft_ids: list[int],
+        options: GenerationOptions,
+    ):
+        import torch
+
+        base_input_ids = inputs["input_ids"]
+        accepted = 0
+        checked = 0
+        chunk_size = max(1, options.chunk_size)
+        generated_ids: list[int] = []
+        with torch.no_grad():
+            logits, cache = self._prefill_cache(inputs)
+            base_cache_len = _cache_seq_length(cache)
+            while accepted < len(draft_ids):
+                chunk = draft_ids[accepted : accepted + chunk_size]
+                chunk_outputs = self._forward_token_ids(chunk, cache, base_input_ids)
+                predicted = _chunk_predictions(logits, chunk_outputs.logits)
+                chunk_matches = 0
+                for actual, expected in zip(predicted, chunk):
+                    checked += 1
+                    if actual != expected:
+                        break
+                    chunk_matches += 1
+
+                accepted += chunk_matches
+                if chunk_matches == len(chunk):
+                    logits = chunk_outputs.logits
+                    cache = chunk_outputs.past_key_values
+                    continue
+
+                rollback_to = base_cache_len + accepted
+                _crop_cache(chunk_outputs.past_key_values, rollback_to)
+                cache = chunk_outputs.past_key_values
+                correction = predicted[chunk_matches]
+                if not _is_eos(self.model, correction):
+                    generated_ids.append(correction)
+                    logits, cache = self._decode_one_with_cache(correction, cache, base_input_ids)
+                generated_ids.extend(self._continue_greedy_from_cache(logits, cache, options.max_tokens, base_input_ids))
+
+                out_ids = draft_ids[:accepted] + generated_ids
+                generated_count = len(generated_ids)
+                stats = DraftVerificationStats(
+                    mode="paddleocr_vl_chunk_verify",
+                    accepted=False,
+                    prefix_accepted=accepted > 0,
+                    draft_tokens=len(draft_ids),
+                    checked_tokens=checked,
+                    matched_tokens=accepted,
+                    accepted_tokens=accepted,
+                    rejected_tokens=len(draft_ids) - accepted,
+                    rollback_tokens=1,
+                    generated_tokens=generated_count,
+                    chunk_size=chunk_size,
+                )
+                return stats, _tensor_from_ids(out_ids, base_input_ids)
+
+        stats = DraftVerificationStats(
+            mode="paddleocr_vl_chunk_verify",
+            accepted=True,
+            prefix_accepted=accepted > 0,
+            draft_tokens=len(draft_ids),
+            checked_tokens=checked,
+            matched_tokens=accepted,
+            accepted_tokens=accepted,
+            rejected_tokens=0,
+            rollback_tokens=0,
+            generated_tokens=0,
+            chunk_size=chunk_size,
+        )
+        return stats, _tensor_from_ids(draft_ids, base_input_ids)
+
+    def _generate_with_dflash_recompute(
+        self,
+        inputs: dict[str, object],
+        draft_ids: list[int],
+        options: GenerationOptions,
+    ):
+        import torch
 
         base_input_ids = inputs["input_ids"]
         accepted = 0
@@ -300,13 +393,13 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         with torch.no_grad():
             while accepted < len(draft_ids):
                 for expected in draft_ids[accepted : accepted + chunk_size]:
-                    predicted = self._predict_next_token(inputs, draft_ids[:accepted])
+                    predicted = self._predict_next_token_recompute(inputs, draft_ids[:accepted])
                     checked += 1
                     if predicted != expected:
-                        generated_ids = self._continue_from_prefix(inputs, draft_ids[:accepted], options)
+                        generated_ids = self._continue_from_prefix_recompute(inputs, draft_ids[:accepted], options)
                         generated_count = int(generated_ids.shape[-1]) - int(base_input_ids.shape[-1]) - accepted
                         stats = DraftVerificationStats(
-                            mode="paddleocr_vl_token_verify",
+                            mode="paddleocr_vl_token_verify_recompute",
                             accepted=False,
                             prefix_accepted=accepted > 0,
                             draft_tokens=len(draft_ids),
@@ -322,7 +415,7 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
                     accepted += 1
 
         stats = DraftVerificationStats(
-            mode="paddleocr_vl_token_verify",
+            mode="paddleocr_vl_token_verify_recompute",
             accepted=True,
             prefix_accepted=accepted > 0,
             draft_tokens=len(draft_ids),
@@ -336,14 +429,51 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         )
         return stats, _tensor_from_ids(draft_ids, base_input_ids)
 
-    def _predict_next_token(self, inputs: dict[str, object], prefix_ids: list[int]) -> int:
+    def _prefill_cache(self, inputs: dict[str, object]):
+        outputs = self.model(**inputs, use_cache=True, logits_to_keep=1)  # type: ignore[operator]
+        return outputs.logits, outputs.past_key_values
+
+    def _forward_token_ids(self, token_ids: list[int], cache: object, like: object):
+        input_ids = _tensor_from_ids(token_ids, like)
+        return self.model(  # type: ignore[operator]
+            input_ids=input_ids,
+            past_key_values=cache,
+            use_cache=True,
+            logits_to_keep=len(token_ids),
+        )
+
+    def _decode_one_with_cache(self, token_id: int, cache: object, like: object):
+        outputs = self._forward_token_ids([token_id], cache, like)
+        return outputs.logits, outputs.past_key_values
+
+    def _continue_greedy_from_cache(
+        self,
+        logits: object,
+        cache: object,
+        max_tokens: int,
+        like: object,
+    ) -> list[int]:
+        import torch
+
+        generated: list[int] = []
+        current_logits = logits
+        current_cache = cache
+        for _ in range(max(0, max_tokens)):
+            token = int(torch.argmax(current_logits[:, -1, :], dim=-1).item())
+            if _is_eos(self.model, token):
+                break
+            generated.append(token)
+            current_logits, current_cache = self._decode_one_with_cache(token, current_cache, like)
+        return generated
+
+    def _predict_next_token_recompute(self, inputs: dict[str, object], prefix_ids: list[int]) -> int:
         import torch
 
         forward_inputs = _append_token_ids(inputs, prefix_ids)
         outputs = self.model(**forward_inputs, logits_to_keep=1, use_cache=False)  # type: ignore[operator]
         return int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
 
-    def _continue_from_prefix(
+    def _continue_from_prefix_recompute(
         self,
         inputs: dict[str, object],
         prefix_ids: list[int],
@@ -355,6 +485,13 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
     def _generate(self, inputs: dict[str, object], options: GenerationOptions):
         import torch
 
+        if not options.sampling:
+            try:
+                return self._generate_with_cache(inputs, options.max_tokens)
+            except (AttributeError, TypeError, RuntimeError) as exc:
+                if not _should_fallback_from_cache_error(exc):
+                    raise
+
         kwargs = {
             "max_new_tokens": options.max_tokens,
             "do_sample": options.sampling,
@@ -363,6 +500,17 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
             kwargs["temperature"] = options.temperature
         with torch.no_grad():
             return self.model.generate(**inputs, **kwargs)  # type: ignore[attr-defined]
+
+    def _generate_with_cache(self, inputs: dict[str, object], max_tokens: int):
+        import torch
+
+        with torch.no_grad():
+            logits, cache = self._prefill_cache(inputs)
+            generated = self._continue_greedy_from_cache(logits, cache, max_tokens, inputs["input_ids"])
+        if not generated:
+            return inputs["input_ids"]
+        generated_ids = _tensor_from_ids(generated, inputs["input_ids"])
+        return torch.cat([inputs["input_ids"], generated_ids], dim=-1)
 
 
 def _paddleocr_vl_prompt(block: LayoutBlock, fallback_prompt: str) -> str:
@@ -451,6 +599,55 @@ def _tokenize_draft(tokenizer: object, draft: str) -> list[int]:
     if hasattr(encoded, "input_ids"):
         return list(encoded.input_ids)
     return list(encoded)
+
+
+def _chunk_predictions(prefix_logits: object, chunk_logits: object) -> list[int]:
+    import torch
+
+    first = torch.argmax(prefix_logits[:, -1, :], dim=-1).reshape(1)
+    if chunk_logits.shape[-2] <= 1:
+        return [int(first.item())]
+    rest = torch.argmax(chunk_logits[:, :-1, :], dim=-1).reshape(-1)
+    return [int(item) for item in torch.cat([first, rest], dim=0).tolist()]
+
+
+def _cache_seq_length(cache: object) -> int:
+    getter = getattr(cache, "get_seq_length", None)
+    if getter is not None:
+        return int(getter())
+    try:
+        first = cache[0][0]
+        return int(first.shape[-2])
+    except Exception:
+        return 0
+
+
+def _crop_cache(cache: object, max_length: int) -> None:
+    crop = getattr(cache, "crop", None)
+    if crop is not None:
+        crop(max_length)
+
+
+def _is_eos(model: object, token_id: int) -> bool:
+    config = getattr(model, "config", None)
+    eos = getattr(config, "eos_token_id", None)
+    if isinstance(eos, list):
+        return token_id in eos
+    return eos is not None and token_id == int(eos)
+
+
+def _should_fallback_from_cache_error(exc: Exception) -> bool:
+    message = str(exc)
+    return any(
+        marker in message
+        for marker in (
+            "past_key_values",
+            "cache",
+            "logits_to_keep",
+            "cannot infer cache",
+            "use_cache",
+        )
+    )
 
 
 def _append_token_ids(inputs: dict[str, object], token_ids: list[int]) -> dict[str, object]:

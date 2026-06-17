@@ -244,7 +244,7 @@ def test_paddleocr_vl_generator_accepts_full_draft(tmp_path):
         image_path,
         LayoutBlock(BoundingBox(0, 0, 10, 10), 1.0, 0, "text"),
         _candidate("alpha beta"),
-        GenerationOptions(chunk_size=1),
+        GenerationOptions(chunk_size=2),
     )
 
     assert recognition is not None
@@ -252,7 +252,10 @@ def test_paddleocr_vl_generator_accepts_full_draft(tmp_path):
     assert recognition.text == "alpha beta"
     assert recognition.draft is not None
     assert recognition.draft.accepted_tokens == 2
+    assert recognition.draft.mode == "paddleocr_vl_chunk_verify"
     assert processor.last_messages[0]["content"][1]["text"] == "OCR:"
+    assert processor.decode_calls == 0
+    assert model.calls == 2
 
 
 def test_paddleocr_vl_generator_prefix_then_generates(tmp_path):
@@ -261,7 +264,7 @@ def test_paddleocr_vl_generator_prefix_then_generates(tmp_path):
     image_path = tmp_path / "page.png"
     Image.new("RGB", (10, 10), "white").save(image_path)
     processor = FakePaddleProcessor({"alpha": 3, "beta": 4, "fixed": 5})
-    model = FakePaddleModel([3, 9], generated_suffix=[5])
+    model = FakePaddleModel([3, 5, 15], generated_suffix=[])
     generator = PaddleOCRVLDFlashGenerator(model, processor)
 
     recognition = generator.recognize(
@@ -346,6 +349,7 @@ class FakePaddleProcessor:
     def __init__(self, vocab):
         self.tokenizer = FakeTokenizer(vocab)
         self.last_messages = None
+        self.decode_calls = 0
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt, return_dict, return_tensors):
         import torch
@@ -361,6 +365,7 @@ class FakePaddleProcessor:
         }
 
     def batch_decode(self, batches, skip_special_tokens=True, clean_up_tokenization_spaces=False):
+        self.decode_calls += 1
         return self.tokenizer.batch_decode(
             batches,
             skip_special_tokens=skip_special_tokens,
@@ -376,6 +381,7 @@ class FakePaddleModel:
         self.generated_suffix = list(generated_suffix)
         self.calls = 0
         self.weight = torch.zeros(1)
+        self.config = type("Config", (), {"eos_token_id": 15})()
 
     def parameters(self):
         yield self.weight
@@ -383,12 +389,24 @@ class FakePaddleModel:
     def __call__(self, **kwargs):
         import torch
 
-        _ = kwargs
-        predicted = self.predictions[self.calls]
+        input_ids = kwargs["input_ids"]
+        past = kwargs.get("past_key_values")
+        use_cache = kwargs.get("use_cache", False)
+        logits_to_keep = int(kwargs.get("logits_to_keep", 0) or 0)
+        seq_len = int(input_ids.shape[-1])
         self.calls += 1
-        logits = torch.zeros((1, 1, 16))
-        logits[0, 0, predicted] = 1.0
-        return type("Out", (), {"logits": logits})
+
+        start = 0 if past is None else past.pred_index
+        out_len = logits_to_keep if logits_to_keep > 0 else seq_len
+        logits = torch.zeros((1, out_len, 16))
+        for offset in range(out_len):
+            pred_index = min(start + offset, len(self.predictions) - 1)
+            logits[0, offset, self.predictions[pred_index]] = 1.0
+        cache = past or FakeCache(seq_len, pred_index=0)
+        if past is not None:
+            cache.length += seq_len
+        cache.pred_index = start + out_len
+        return type("Out", (), {"logits": logits, "past_key_values": cache if use_cache else None})
 
     def generate(self, **kwargs):
         import torch
@@ -396,3 +414,23 @@ class FakePaddleModel:
         input_ids = kwargs["input_ids"]
         suffix = torch.tensor([self.generated_suffix], dtype=input_ids.dtype, device=input_ids.device)
         return torch.cat([input_ids, suffix], dim=-1)
+
+
+class FakeCache:
+    def __init__(self, length, pred_index=0):
+        import torch
+
+        self.length = length
+        self.pred_index = pred_index
+        self.tensor = torch.zeros((1, 1, max(length, 1), 1))
+
+    def get_seq_length(self):
+        return self.length
+
+    def crop(self, max_length):
+        self.length = min(self.length, max_length)
+
+    def __getitem__(self, index):
+        if index != 0:
+            raise IndexError(index)
+        return (self.tensor, self.tensor)
