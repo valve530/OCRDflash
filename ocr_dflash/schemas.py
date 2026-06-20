@@ -200,10 +200,29 @@ class PageReport:
     block_count: int
     layout_ms: float
     native_text_ms: float
+    native_direct_ms: float
+    vlm_ms: float
     recognition_ms: float
     total_ms: float
     artifacts: PageArtifacts
     blocks: list[PageDemoBlock]
+    config: dict[str, Any] = field(default_factory=dict)
+    stats: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class PdfReport:
+    schema_version: int
+    source: str
+    page_count: int
+    total_layout_ms: float
+    total_native_text_ms: float
+    total_native_direct_ms: float
+    total_vlm_ms: float
+    total_ms: float
+    peak_vram_mb: float | None
+    avg_vram_mb: float | None
+    pages: list[PageReport]
     config: dict[str, Any] = field(default_factory=dict)
     stats: dict[str, Any] = field(default_factory=dict)
 

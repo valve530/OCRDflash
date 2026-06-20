@@ -66,7 +66,6 @@ def _parse_args() -> argparse.Namespace:
 
 def _setup_debug_env(proxy: str | None) -> None:
     os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-    os.environ.setdefault("HF_HOME", str(Path("hf-cache").resolve()))
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
     if proxy:
         os.environ.setdefault("HTTP_PROXY", proxy)

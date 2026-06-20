@@ -67,6 +67,39 @@ def write_text_metrics(out_path: str | Path, metrics: TextMetrics | dict[str, ob
     write_json(out_path, metrics)
 
 
+def summarize_dflash_report(report_path: str | Path, prefix: int = 120) -> str:
+    report = read_json(report_path)
+    stats = report.get("stats", {})
+    lines = [
+        "summary: "
+        f"accepted={stats.get('accepted_tokens', 0)}/{stats.get('draft_tokens', 0)} "
+        f"ratio={float(stats.get('accepted_token_ratio', 0.0)):.3%} "
+        f"vlm_ms={float(report.get('vlm_ms', report.get('recognition_ms', 0.0))):.1f} "
+        f"total_ms={float(report.get('total_ms', 0.0)):.1f}"
+    ]
+    for block in report.get("blocks", []):
+        recognition = block.get("recognition") or {}
+        draft = recognition.get("draft") or {}
+        if not draft:
+            continue
+        native_text = block.get("native_text_draft") or ""
+        output_text = recognition.get("text") or ""
+        lines.extend(
+            [
+                "",
+                (
+                    f"block {block.get('index')} {block.get('class_name')}: "
+                    f"{recognition.get('backend')} "
+                    f"accepted={draft.get('accepted_tokens', 0)}/{draft.get('draft_tokens', 0)} "
+                    f"checked={draft.get('checked_tokens', 0)}"
+                ),
+                f"  native: {native_text[:prefix]!r}",
+                f"  output: {output_text[:prefix]!r}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def levenshtein(left: str, right: str) -> int:
     if left == right:
         return 0

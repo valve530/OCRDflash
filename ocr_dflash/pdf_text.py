@@ -431,11 +431,21 @@ def _normalize_native_text(text: str) -> str:
         if ch.isspace():
             pending_space = True
             continue
-        if pending_space and out and out[-1][-1].isalnum() and ch.isalnum():
+        if pending_space and _should_keep_native_space(out[-1][-1] if out else None, ch):
             out.append(" ")
         out.append(ch)
         pending_space = False
     return "".join(out).strip()
+
+
+def _should_keep_native_space(prev: str | None, next_: str) -> bool:
+    if prev is None:
+        return False
+    return (
+        (prev.isascii() and prev.isalnum() and next_.isascii() and next_.isalnum())
+        or (prev.isascii() and prev.isalnum() and _is_cjk(next_))
+        or (_is_cjk(prev) and next_.isascii() and next_.isalnum())
+    )
 
 
 def _should_insert_inferred_space(prev: _CharBox | None, next_: _CharBox) -> bool:

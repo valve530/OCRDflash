@@ -101,11 +101,36 @@ uv run ocr-dflash parse-page \
   --max-tokens 256
 ```
 
+If the model is not already present in the Hugging Face cache, download it
+first. With a restricted network, use the local proxy and disable Xet:
+
+```sh
+HTTP_PROXY=http://100.64.0.250:7890 \
+HTTPS_PROXY=http://100.64.0.250:7890 \
+ALL_PROXY=http://100.64.0.250:7890 \
+HF_HUB_DISABLE_XET=1 \
+uv run hf download PaddlePaddle/PaddleOCR-VL \
+  --include "model.safetensors" \
+  --include "*.json" \
+  --include "*.py" \
+  --include "*.jinja" \
+  --include "tokenizer.*" \
+  --include "preprocessor_config.json"
+```
+
+To keep the model inside the project instead of the global Hugging Face cache,
+add `--local-dir ./models/PaddleOCR-VL` and pass
+`--vlm-model ./models/PaddleOCR-VL` when running `parse-page`.
+
 Without `--vlm-model`, `parse-page` deliberately stays on the fast PDF native
 text baseline and no model is loaded. With `--vlm-backend paddleocr-vl`, the
 pipeline loads `PaddleOCRVLForConditionalGeneration`, formats the image prompt
 with the PaddleOCR-VL chat template, verifies PDF native text draft tokens, and
-falls back to VLM generation after the first mismatch.
+falls back to VLM generation after the first mismatch for blocks that are not
+directly accepted. The PDF benchmark path now batches recognition across pages
+after layout is prepared, so the VLM sees larger micro-batches. Use
+`--verify-native-text` to force direct-accept candidates through VLM/DFlash
+verification for ablations.
 
 The generic adapter uses `AutoProcessor` and `AutoModelForImageTextToText`
 first, then falls back to `AutoModelForCausalLM`.
@@ -138,6 +163,8 @@ uv run ocr-dflash compare-text \
   --expected baseline/report.json \
   --actual experiment/report.json \
   --out compare.json
+
+uv run ocr-dflash analyze-report experiment/report.json
 ```
 
 The helper reports character accuracy, edit distance, exact match, and block
@@ -158,10 +185,10 @@ The implemented P0/P1 research scaffold includes:
 - Markdown assembly
 
 `DraftVerifyingGenerator` remains the extension point for another document VLM.
-`PaddleOCRVLDFlashGenerator` is the concrete PaddleOCR-VL adapter. Its current
-Python implementation is intentionally correctness-first: it re-runs a forward
-pass for draft-token checks instead of using the Rust/MLX KV-cache optimized
-loop.
+`PaddleOCRVLDFlashGenerator` is the concrete PaddleOCR-VL adapter. It uses a
+KV-cache chunk verification loop for greedy decoding when the model exposes
+`past_key_values`, and falls back to a correctness-first recompute verifier if a
+model backend cannot support cache-based verification.
 
 ## Tests
 

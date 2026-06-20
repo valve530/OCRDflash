@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 hf-cache
+models/
 tmp/
 scripts/
 docs/
