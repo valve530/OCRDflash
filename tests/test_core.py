@@ -181,17 +181,14 @@ def test_dflash_chunks_isolate_special_tokens():
     assert _split_dflash_chunks(PieceTokenizer(), [1, 2, 3, 4, 5], 2) == [[1], [2], [3], [4], [5]]
 
 
-def test_cli_exposes_batch_max_pixels():
+def test_cli_defaults_to_simple_dflash_runner():
     from ocr_dflash.cli import build_parser
 
     parser = build_parser()
-    parse_pdf = next(action for action in parser._actions if getattr(action, "dest", None) == "command").choices["parse-pdf"]
-    batch_defaults = {}
-    for action in parse_pdf._actions:
-        if getattr(action, "dest", None) in {"batch_max_pixels", "batch_size"}:
-            batch_defaults[action.dest] = action.default
-    assert batch_defaults["batch_size"] == 128
-    assert batch_defaults["batch_max_pixels"] == 0
+    args = parser.parse_args(["--pdf", "sample.pdf"])
+    assert args.mode == "dflash"
+    assert args.chunk_size == 8
+    assert args.layout_model_dir.name == "PP-DocLayoutV3"
 
 
 def test_page_stats_report_research_metrics():

@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug simple_vlm dflash",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocr_dflash.simple_vlm",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": []
+    },
+    {
+      "name": "Debug simple_vlm baseline",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "ocr_dflash.simple_vlm",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "args": ["--mode", "baseline"]
+    }
+  ]
+}

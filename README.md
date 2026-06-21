@@ -1,226 +1,69 @@
 # ocr-dflash
 
-Python research implementation of PDF-native draft-guided document OCR.
+Simple research runner for:
 
-The pipeline follows `docs/python_pdf_vlm_acceleration_prd.md` and mirrors the
-artifact shape used by `/home/valve/flash-doc-rs`:
+1. render every PDF page
+2. run PP-DocLayoutV3 on CUDA
+3. extract PDF native text for each layout block
+4. run PaddleOCR-VL baseline `generate()` or `dflash_generate()`
 
-- `layout.json`
-- `native_text.json`
-- `page.md`
-- `report.json`
+The project still uses `uv` to create/run the environment, but package
+installation is intentionally done with `uv pip`.
 
 ## Install
 
 ```sh
-uv sync --dev
+uv venv
+uv pip install --python .venv/bin/python -e .
+uv pip install --python .venv/bin/python pymupdf pillow paddleocr paddlepaddle-gpu transformers torch torchvision flash-attn
 ```
 
-For the VLM overlay on this machine:
+Use the proxy only when needed:
 
 ```sh
 HTTP_PROXY=http://100.64.0.250:7890 \
 HTTPS_PROXY=http://100.64.0.250:7890 \
 ALL_PROXY=http://100.64.0.250:7890 \
-uv sync --dev --no-default-groups --group vlm
+uv pip install --python .venv/bin/python accelerate
 ```
 
-If the network is restricted, use the local proxy:
+Models are expected locally:
+
+- `models/PP-DocLayoutV3`
+- `models/PaddleOCR-VL-1.6`
+
+## Run
+
+DFlash + PDF native text:
 
 ```sh
-HTTP_PROXY=http://100.64.0.250:7890 \
-HTTPS_PROXY=http://100.64.0.250:7890 \
-ALL_PROXY=http://100.64.0.250:7890 \
-UV_CACHE_DIR=/tmp/uv-cache \
-uv sync --dev
+uv run --no-sync ocr-dflash --pdf tmp/attention_1.pdf --out-dir tmp/dflash
 ```
 
-## Parse One Page
+If the console script has not been installed yet, use the module form:
 
 ```sh
-uv run ocr-dflash parse-page \
-  --pdf sample.pdf \
-  --page 0 \
-  --dpi 200 \
-  --out-dir out/sample
+uv run --no-sync python -m ocr_dflash.cli --pdf tmp/attention_1.pdf --out-dir tmp/dflash
 ```
 
-For image input:
+Baseline VLM `model.generate()`:
 
 ```sh
-uv run ocr-dflash parse-page \
-  --image page.png \
-  --out-dir out/page
+uv run --no-sync ocr-dflash --pdf tmp/attention_1.pdf --out-dir tmp/baseline --mode baseline
 ```
 
-An external layout result can be supplied with `--layout-json`; otherwise the
-research baseline uses one whole-page text block. For PDFs, `--layout-mode
-pdf-lines` builds block crops from the PDF text line boxes so native drafts can
-be verified block by block. If the optional PaddleOCR layout package/model is
-available, `--layout-mode pp-doclayout-v2` runs PP-DocLayoutV2 and writes the
-same `layout.json` schema.
-
-Useful research switches:
+Small debug helper:
 
 ```sh
-# Disable PDF drafts for ablation.
-uv run ocr-dflash parse-page \
-  --pdf sample.pdf \
-  --out-dir out/no-draft \
-  --draft-mode none
-
-# Force native drafts through the verification path once a verifier adapter is
-# plugged in; without a concrete VLM adapter this disables direct accept.
-uv run ocr-dflash parse-page \
-  --pdf sample.pdf \
-  --out-dir out/verify \
-  --verify-native-text
-
-# Change chunking and decoding controls recorded in report.json.
-uv run ocr-dflash parse-page \
-  --pdf sample.pdf \
-  --out-dir out/chunk8 \
-  --chunk-size 8 \
-  --max-tokens 512 \
-  --sampling \
-  --temperature 0.7
+uv run --no-sync python demo.py
 ```
 
-`report.json` records draft coverage, accepted token ratio, rollback ratio,
-average accepted prefix length, direct/prefix/fallback block counts, and the
-generation config used for the run.
+## Important Files
 
-To use a Hugging Face / PaddleOCR-VL style model for block generation:
+- `ocr_dflash/simple_pipeline.py`: PDF -> layout -> native text -> VLM/DFlash
+- `ocr_dflash/simple_vlm.py`: official baseline `generate()` and `dflash_generate()`
+- `ocr_dflash/layout_demo.py`: official-style PP-DocLayoutV3 smoke
+- `ocr_dflash/transformers_demo.py`: official-style PaddleOCR-VL smoke
 
-```sh
-HTTP_PROXY=http://100.64.0.250:7890 \
-HTTPS_PROXY=http://100.64.0.250:7890 \
-ALL_PROXY=http://100.64.0.250:7890 \
-HF_HUB_DISABLE_XET=1 \
-uv run ocr-dflash parse-page \
-  --pdf sample.pdf \
-  --out-dir out/vlm \
-  --layout-mode pdf-lines \
-  --vlm-model ./models/PaddleOCR-VL-1.6 \
-  --vlm-backend paddleocr-vl \
-  --vlm-device auto \
-  --vlm-dtype bf16 \
-  --vlm-attn-implementation flash_attention_2 \
-  --vlm-max-pixels 1003520 \
-  --verify-native-text \
-  --chunk-size 8 \
-  --max-tokens 256
-```
-
-If the model is not already present in the Hugging Face cache, download it
-first. With a restricted network, use the local proxy and disable Xet:
-
-```sh
-HTTP_PROXY=http://100.64.0.250:7890 \
-HTTPS_PROXY=http://100.64.0.250:7890 \
-ALL_PROXY=http://100.64.0.250:7890 \
-HF_HUB_DISABLE_XET=1 \
-uv run hf download PaddlePaddle/PaddleOCR-VL-1.6 \
-  --include "model.safetensors" \
-  --include "*.json" \
-  --include "*.py" \
-  --include "*.jinja" \
-  --include "tokenizer.*" \
-  --include "preprocessor_config.json"
-```
-
-To keep the model inside the project instead of the global Hugging Face cache,
-add `--local-dir ./models/PaddleOCR-VL-1.6` and pass
-`--vlm-model ./models/PaddleOCR-VL-1.6` when running `parse-page`.
-
-Without `--vlm-model`, `parse-page` deliberately stays on the fast PDF native
-text baseline and no model is loaded. With `--vlm-backend paddleocr-vl`, the
-pipeline loads the PaddleOCR-VL remote-code model, formats the image prompt
-with the PaddleOCR-VL chat template, verifies PDF native text draft tokens, and
-falls back to VLM generation after the first mismatch for blocks that are not
-directly accepted. The PDF benchmark path now batches recognition across pages
-after layout is prepared, so the VLM sees larger micro-batches. Use
-`--verify-native-text` to force direct-accept candidates through VLM/DFlash
-verification for ablations.
-
-The PaddleOCR-VL path uses `AutoProcessor` and the model's remote-code
-`PaddleOCRVLForConditionalGeneration` class through `AutoModelForCausalLM`.
-
-For a real layout model instead of PDF text-line chunks:
-
-```sh
-uv run ocr-dflash parse-page \
-  --pdf sample.pdf \
-  --out-dir out/layout-vlm \
-  --layout-mode pp-doclayout-v2 \
-  --layout-device gpu \
-  --vlm-model PaddlePaddle/PaddleOCR-VL-1.6 \
-  --vlm-backend paddleocr-vl
-```
-
-`pp-doclayout-v2` is optional because PaddleOCR/Paddle wheels are heavy and
-platform-specific. Without that package installed, use `pdf-lines` or
-`--layout-json`.
-
-## Evaluation Helpers
-
-```sh
-uv run ocr-dflash compare-text \
-  --expected baseline/page.md \
-  --actual experiment/page.md
-
-uv run ocr-dflash compare-text \
-  --kind report \
-  --expected baseline/report.json \
-  --actual experiment/report.json \
-  --out compare.json
-
-uv run ocr-dflash analyze-report experiment/report.json
-```
-
-The helper reports character accuracy, edit distance, exact match, and block
-exact-match ratios for `report.json` files.
-
-## Current Model Boundary
-
-The implemented P0/P1 research scaffold includes:
-
-- PDF page rendering with PyMuPDF
-- PDF native text extraction and Rust-aligned quality heuristics
-- layout adapter layer with whole-page, PDF-line, external JSON, and optional
-  PaddleOCR PP-DocLayoutV2 modes
-- native draft direct accept / fallback behavior
-- token-level draft verification primitives
-- PaddleOCR-VL block generation with draft verification / prefix continuation
-- block/page reports with accepted, matched, generated, and rollback stats
-- Markdown assembly
-
-`DraftVerifyingGenerator` remains the extension point for another document VLM.
-`PaddleOCRVLDFlashGenerator` is the concrete PaddleOCR-VL adapter. It uses a
-KV-cache chunk verification loop for greedy decoding when the model exposes
-`past_key_values`, and falls back to a correctness-first recompute verifier if a
-model backend cannot support cache-based verification.
-
-PaddleOCR-VL-1.6 follows the official Paddle stack:
-
-- `paddlepaddle-gpu==3.2.1`
-- `paddleocr[doc-parser]>=3.6.0`
-- `transformers>=5.0.0`
-
-The VLM path needs a small torch overlay in the same `.venv` on this machine.
-Use `uv add` so the environment stays reproducible:
-
-```sh
-HTTP_PROXY=http://100.64.0.250:7890 \
-HTTPS_PROXY=http://100.64.0.250:7890 \
-ALL_PROXY=http://100.64.0.250:7890 \
-uv add --group vlm
-```
-
-For a quick local debug run, use `demo.py`.
-
-## Tests
-
-```sh
-uv run pytest -q
-```
+The old broader pipeline files are left in the tree for reference while the
+active CLI points at the simplified path.

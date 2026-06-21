@@ -1,5 +1,5 @@
-"""PDF-native draft-guided document OCR research pipeline."""
+"""Simple PDF native-text + PaddleOCR-VL DFlash research runner."""
 
-from .pipeline import PipelineOptions, run_page_pipeline
+from ocr_dflash.simple_pipeline import SimpleOptions, run_pdf
 
-__all__ = ["PipelineOptions", "run_page_pipeline"]
+__all__ = ["SimpleOptions", "run_pdf"]

@@ -98,6 +98,7 @@ class PaddleOCRLayoutDetector(LayoutDetector):
     def __init__(
         self,
         model_name: str = "PP-DocLayoutV2",
+        model_dir: str | Path | None = None,
         device: str | None = None,
         threshold: float = 0.5,
         img_size: int | None = None,
@@ -106,6 +107,7 @@ class PaddleOCRLayoutDetector(LayoutDetector):
         layout_merge_bboxes_mode: str | None = None,
     ):
         self.model_name = model_name
+        self.model_dir = Path(model_dir) if model_dir is not None else None
         self.device = device
         self.threshold = threshold
         self.img_size = img_size
@@ -117,7 +119,7 @@ class PaddleOCRLayoutDetector(LayoutDetector):
     def detect(self, image_path: Path, image_size: tuple[int, int]) -> DetectionResult:
         width, height = image_size
         model = self._load_model()
-        raw = _run_paddleocr_layout_model(model, image_path)
+        raw = _run_paddleocr_layout_model(model, image_path, layout_nms=self.layout_nms)
         blocks = [
             block
             for block in (_layout_block_from_paddleocr(item, index, width, height) for index, item in enumerate(raw))
@@ -147,16 +149,8 @@ class PaddleOCRLayoutDetector(LayoutDetector):
             ) from exc
 
         kwargs: dict[str, object] = {}
-        if self.img_size is not None:
-            kwargs["img_size"] = self.img_size
-        if self.threshold is not None:
-            kwargs["threshold"] = self.threshold
-        if self.layout_nms is not None:
-            kwargs["layout_nms"] = self.layout_nms
-        if self.layout_unclip_ratio is not None:
-            kwargs["layout_unclip_ratio"] = self.layout_unclip_ratio
-        if self.layout_merge_bboxes_mode is not None:
-            kwargs["layout_merge_bboxes_mode"] = self.layout_merge_bboxes_mode
+        if self.model_dir is not None:
+            kwargs["model_dir"] = str(self.model_dir)
         if self.device:
             kwargs["device"] = self.device
             if self.device.startswith("cpu"):
@@ -184,9 +178,10 @@ def should_use_native_text(class_name: str) -> bool:
     return class_name in TEXT_NATIVE_CLASSES
 
 
-def _run_paddleocr_layout_model(model: object, image_path: Path) -> list[Any]:
+def _run_paddleocr_layout_model(model: object, image_path: Path, *, layout_nms: bool | None = None) -> list[Any]:
     if hasattr(model, "predict"):
-        result = model.predict(str(image_path))  # type: ignore[attr-defined]
+        kwargs = {"layout_nms": layout_nms} if layout_nms is not None else {}
+        result = model.predict(str(image_path), **kwargs)  # type: ignore[attr-defined]
     elif callable(model):
         result = model(str(image_path))  # type: ignore[operator]
     else:
@@ -241,7 +236,7 @@ def _layout_block_from_paddleocr(
         )
         class_name = str(item.get("label") or item.get("class_name") or item.get("category") or "text")
         score = float(item.get("score") or item.get("confidence") or 1.0)
-        label = int(item.get("class_id") or item.get("cls_id") or item.get("label_id") or index)
+        label = _layout_label_id(item, index)
     elif isinstance(item, (list, tuple)) and len(item) >= 4:
         bbox_value = item[:4]
         class_name = "text"
@@ -257,6 +252,16 @@ def _layout_block_from_paddleocr(
     if bbox.width <= 1.0 or bbox.height <= 1.0:
         return None
     return LayoutBlock(bbox=bbox, score=score, label=label, class_name=_normalize_layout_class(class_name))
+
+
+def _layout_label_id(item: dict[str, Any], fallback: int) -> int:
+    for key in ("class_id", "cls_id", "label_id"):
+        value = item.get(key)
+        if isinstance(value, Real):
+            return int(value)
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return fallback
 
 
 def _bbox_from_layout_value(value: Any) -> BoundingBox | None:
