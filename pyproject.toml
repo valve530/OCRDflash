@@ -3,18 +3,15 @@ name = "ocr-dflash"
 version = "0.1.0"
 description = "PDF-native draft-guided VLM acceleration research pipeline"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-    "accelerate>=1.14.0",
     "einops>=0.8.2",
-    "paddleocr>=3.7.0",
-    "paddlepaddle>=3.3.1",
+    "paddleocr[doc-parser]>=3.6.0",
+    "paddlepaddle-gpu==3.2.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "pillow>=10.4.0",
     "pymupdf>=1.24.10",
     "sentencepiece>=0.2.1",
-    "torch>=2.11.0",
-    "torchvision>=0.26.0",
-    "transformers>=4.45.0",
+    "transformers>=5.0.0",
 ]
 
 [dependency-groups]
@@ -33,14 +30,11 @@ build-backend = "hatchling.build"
 packages = ["ocr_dflash"]
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "paddle-cu126"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu126/"
 explicit = true
 
 [tool.uv.sources]
-torch = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
-torchvision = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+paddlepaddle-gpu = [
+  { index = "paddle-cu126", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
 ]

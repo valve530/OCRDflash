@@ -35,6 +35,14 @@ class _PreparedPaddleBatch:
 
 
 @dataclass(slots=True)
+class _PreparedPaddleDflashBatch:
+    group: list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]]
+    inputs: list[dict[str, object]]
+    drafts: list[str]
+    draft_ids: list[list[int]]
+
+
+@dataclass(slots=True)
 class _PreparedPaddleRecognition:
     index: int
     image_path: Path
@@ -311,10 +319,11 @@ class TransformersVlmGenerator(BlockGenerator):
 
 
 class PaddleOCRVLDFlashGenerator(BlockGenerator):
-    def __init__(self, model: object, processor: object):
+    def __init__(self, model: object, processor: object, max_pixels: int | None = None):
         self.model = model
         self.processor = processor
         self.tokenizer = getattr(processor, "tokenizer", processor)
+        self.max_pixels = max_pixels
 
     def recognize(
         self,
@@ -350,7 +359,7 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         started: float,
     ) -> BlockRecognition | None:
         crop = image.crop((block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)).convert("RGB")  # type: ignore[attr-defined]
-        inputs = _paddleocr_vl_inputs(self.processor, crop, _paddleocr_vl_prompt(block, options.prompt))
+        inputs = _paddleocr_vl_inputs(self.processor, crop, _paddleocr_vl_prompt(block, options.prompt), self.max_pixels)
         inputs = _move_tensors(dict(inputs), _model_device(self.model))
 
         draft = _normalize_dflash_draft(native_candidate.text).strip() if native_candidate and native_candidate.text.strip() else ""
@@ -402,6 +411,9 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         requests: list[tuple[Path, LayoutBlock, NativeTextCandidate | None]],
         options: GenerationOptions,
     ) -> list[BlockRecognition | None]:
+        if _requires_safe_paddleocr_vl_path(self.model):
+            return self._recognize_many_with_paths_sequential(requests, options)
+
         if not requests:
             return []
 
@@ -431,30 +443,42 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
 
         results: list[BlockRecognition | None] = [None] * len(requests)
         if direct:
+            direct.sort(key=_paddleocr_vl_batch_sort_key, reverse=True)
+            batch_size = max(1, int(getattr(options, "batch_size", 8)))
+            max_tile_pixels = int(getattr(options, "batch_max_pixels", 0) or 0)
+            direct_groups: list[list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]]] = []
+            for start in range(0, len(direct), batch_size):
+                group = direct[start : start + batch_size]
+                if max_tile_pixels > 0:
+                    group = _split_batch_by_pixels(group, max_tile_pixels)
+                direct_groups.append(group)
+
             with ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
-                    _prepare_paddleocr_vl_recognition_from_cache,
+                    _prepare_paddleocr_vl_dflash_batch_from_cache,
                     self.processor,
-                    direct[0],
+                    direct_groups[0],
                     options.prompt,
                     opened_images,
                 )
-                for direct_index, _request in enumerate(direct):
+                for group_index, group in enumerate(direct_groups):
                     prepared = future.result()
-                    if direct_index + 1 < len(direct):
+                    if group_index + 1 < len(direct_groups):
                         future = executor.submit(
-                            _prepare_paddleocr_vl_recognition_from_cache,
+                            _prepare_paddleocr_vl_dflash_batch_from_cache,
                             self.processor,
-                            direct[direct_index + 1],
+                            direct_groups[group_index + 1],
                             options.prompt,
                             opened_images,
                         )
-                    results[prepared.index] = self._recognize_prepared(prepared, options)
+                    batch_results = self._run_recognition_batch(prepared, options)
+                    for (index, _image_path, _block, _native_candidate), recognition in zip(group, batch_results):
+                        results[index] = recognition
 
         if batchable:
             batch_size = max(1, int(getattr(options, "batch_size", 8)))
             max_tile_pixels = int(getattr(options, "batch_max_pixels", 0) or 0)
-            batchable.sort(key=_paddleocr_vl_batch_sort_key, reverse=True)
+            batchable.sort(key=_paddleocr_vl_group_sort_key, reverse=True)
             batch_groups: list[list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]]] = []
             for start in range(0, len(batchable), batch_size):
                 group = batchable[start : start + batch_size]
@@ -510,6 +534,30 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
 
         return results
 
+    def _recognize_many_with_paths_sequential(
+        self,
+        requests: list[tuple[Path, LayoutBlock, NativeTextCandidate | None]],
+        options: GenerationOptions,
+    ) -> list[BlockRecognition | None]:
+        opened_images: dict[Path, object] = {}
+        results: list[BlockRecognition | None] = [None] * len(requests)
+        for index, (image_path, block, native_candidate) in enumerate(requests):
+            prepared = _prepare_paddleocr_vl_recognition_from_cache(
+                self.processor,
+                (index, image_path, block, native_candidate),
+                options.prompt,
+                opened_images,
+            )
+            results[index] = self._recognize_prepared(prepared, options)
+
+        for image in opened_images.values():
+            try:
+                image.close()
+            except Exception:
+                pass
+
+        return results
+
     def recognize_many_with_image(
         self,
         image_path: Path,
@@ -536,6 +584,174 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
             prepared.draft,
         )
 
+    def _run_recognition_batch(
+        self,
+        prepared: _PreparedPaddleDflashBatch,
+        options: GenerationOptions,
+    ) -> list[BlockRecognition | None]:
+        import torch
+
+        started = time.perf_counter()
+        device = _model_device(self.model)
+        batch_inputs = _move_tensors(_stack_paddle_inputs(prepared.inputs), device)
+        batch_inputs, prompt_lengths = _append_batch_dflash_drafts(batch_inputs, prepared.drafts, self.tokenizer)
+        try:
+            outputs = self.model(**batch_inputs, use_cache=False)  # type: ignore[operator]
+            logits = outputs.logits
+        except Exception:
+            return [
+                self._recognize_dflash_single(
+                    item_inputs,
+                    block,
+                    native_candidate,
+                    draft_text,
+                    options,
+                )
+                for (block, native_candidate, draft_text, item_inputs) in zip(
+                    (request[2] for request in prepared.group),
+                    (request[3] for request in prepared.group),
+                    prepared.drafts,
+                    prepared.inputs,
+                )
+            ]
+
+        results: list[BlockRecognition | None] = []
+        for index, (block, native_candidate, draft_text, draft_ids, item_inputs, prompt_len) in enumerate(
+            zip(
+                (request[2] for request in prepared.group),
+                (request[3] for request in prepared.group),
+                prepared.drafts,
+                prepared.draft_ids,
+                prepared.inputs,
+                prompt_lengths,
+            )
+        ):
+            draft_len = len(draft_ids)
+            draft_logits = logits[index : index + 1, max(0, prompt_len - 1) : max(0, prompt_len - 1) + draft_len, :]
+            if draft_logits.ndim == 3 and draft_logits.shape[0] == 1:
+                draft_logits = draft_logits[0]
+            predicted = torch.argmax(draft_logits, dim=-1).tolist()
+            accepted = 0
+            for actual, expected in zip(predicted, draft_ids):
+                if actual != expected:
+                    break
+                accepted += 1
+
+            if accepted == draft_len:
+                stats = DraftVerificationStats(
+                    mode="paddleocr_vl_batch_verify",
+                    accepted=True,
+                    prefix_accepted=accepted > 0,
+                    draft_tokens=draft_len,
+                    checked_tokens=draft_len,
+                    matched_tokens=draft_len,
+                    accepted_tokens=draft_len,
+                    rejected_tokens=0,
+                    rollback_tokens=0,
+                    generated_tokens=0,
+                    chunk_size=max(1, options.chunk_size),
+                )
+                results.append(
+                    BlockRecognition(
+                        backend="paddleocr-vl:dflash:accepted",
+                        text=draft_text,
+                        tokens=accepted,
+                        ms=(time.perf_counter() - started) * 1000.0,
+                        draft=stats,
+                    )
+                )
+                continue
+
+            accepted_prefix = _prefix_by_tokens(draft_text, accepted)
+            suffix = self._generate_from_prefix(item_inputs, accepted_prefix, options)
+            stats = DraftVerificationStats(
+                mode="paddleocr_vl_batch_verify",
+                accepted=False,
+                prefix_accepted=accepted > 0,
+                draft_tokens=draft_len,
+                checked_tokens=draft_len,
+                matched_tokens=accepted,
+                accepted_tokens=accepted,
+                rejected_tokens=draft_len - accepted,
+                rollback_tokens=1,
+                generated_tokens=len(tokenize_text(self.tokenizer, suffix)),
+                chunk_size=max(1, options.chunk_size),
+            )
+            results.append(
+                BlockRecognition(
+                    backend="paddleocr-vl:dflash:prefix" if accepted > 0 else "paddleocr-vl:dflash:fallback-generate",
+                    text=accepted_prefix + suffix,
+                    tokens=accepted + len(tokenize_text(self.tokenizer, suffix)),
+                    ms=(time.perf_counter() - started) * 1000.0,
+                    draft=stats,
+                )
+            )
+
+        return results
+
+    def _recognize_dflash_single(
+        self,
+        inputs: dict[str, object],
+        block: LayoutBlock,
+        native_candidate: NativeTextCandidate | None,
+        draft_text: str,
+        options: GenerationOptions,
+    ) -> BlockRecognition | None:
+        started = time.perf_counter()
+        inputs = _move_tensors(dict(inputs), _model_device(self.model))
+        stats, generated_ids = self._generate_with_dflash(inputs, draft_text, options)
+        if stats is None:
+            output_ids = self._generate(inputs, options)
+            generated_ids = _trim_prompt_ids(output_ids, inputs)
+            return BlockRecognition(
+                backend="paddleocr-vl:generate",
+                text=_decode_generated(self.processor, generated_ids, generated_ids),
+                tokens=int(generated_ids.shape[-1]) if hasattr(generated_ids, "shape") else len(tokenize_text(self.tokenizer, _decode_generated(self.processor, generated_ids, generated_ids))),
+                ms=(time.perf_counter() - started) * 1000.0,
+                draft=None,
+            )
+        if stats.accepted:
+            return BlockRecognition(
+                backend="paddleocr-vl:dflash:accepted",
+                text=draft_text,
+                tokens=stats.accepted_tokens,
+                ms=(time.perf_counter() - started) * 1000.0,
+                draft=stats,
+            )
+        if stats.prefix_accepted:
+            accepted_prefix = _prefix_by_tokens(draft_text, stats.accepted_tokens)
+            suffix = self._generate_from_prefix(inputs, accepted_prefix, options)
+            stats.generated_tokens = len(tokenize_text(self.tokenizer, suffix))
+            return BlockRecognition(
+                backend="paddleocr-vl:dflash:prefix",
+                text=accepted_prefix + suffix,
+                tokens=stats.accepted_tokens + stats.generated_tokens,
+                ms=(time.perf_counter() - started) * 1000.0,
+                draft=stats,
+            )
+        output_ids = self._generate(inputs, options)
+        generated_ids = _trim_prompt_ids(output_ids, inputs)
+        text = _decode_generated(self.processor, generated_ids, generated_ids)
+        return BlockRecognition(
+            backend="paddleocr-vl:dflash:fallback-generate",
+            text=text,
+            tokens=int(generated_ids.shape[-1]) if hasattr(generated_ids, "shape") else len(tokenize_text(self.tokenizer, text)),
+            ms=(time.perf_counter() - started) * 1000.0,
+            draft=stats,
+        )
+
+    def _generate_from_prefix(
+        self,
+        inputs: dict[str, object],
+        accepted_prefix: str,
+        options: GenerationOptions,
+    ) -> str:
+        prefix_ids = _tokenize_draft(self.tokenizer, accepted_prefix)
+        generate_inputs = _append_token_ids(inputs, prefix_ids)
+        output_ids = self._generate(generate_inputs, options)
+        generated_ids = _trim_prompt_ids(output_ids, generate_inputs)
+        return _decode_generated(self.processor, generated_ids, generated_ids)
+
     def _run_recognition(
         self,
         inputs: dict[str, object],
@@ -545,6 +761,7 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         started: float,
         draft: str | None = None,
     ) -> BlockRecognition | None:
+        inputs = _move_tensors(dict(inputs), _model_device(self.model))
         draft_text = _normalize_dflash_draft(native_candidate.text).strip() if draft is None and native_candidate and native_candidate.text.strip() else (draft or "")
         if draft_text and should_use_native_text(block.class_name):
             stats, generated_ids = self._generate_with_dflash(inputs, draft_text, options)
@@ -835,6 +1052,11 @@ def _paddleocr_vl_batch_sort_key(item: tuple[int, Path, LayoutBlock, NativeTextC
     return (height, width, block.bbox.area)
 
 
+def _paddleocr_vl_group_sort_key(item: tuple[int, Path, LayoutBlock, NativeTextCandidate | None]) -> tuple[str, int, float, float]:
+    _index, _image_path, block, _native_candidate = item
+    return (block.class_name, _paddleocr_vl_width_bucket(block), max(0.0, block.bbox.height), block.bbox.area)
+
+
 def _split_batch_by_pixels(
     group: list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]],
     max_tile_pixels: int,
@@ -855,6 +1077,7 @@ def _prepare_paddleocr_vl_recognition_from_cache(
     request: tuple[int, Path, LayoutBlock, NativeTextCandidate | None],
     prompt: str,
     opened_images: dict[Path, object],
+    max_pixels: int | None = None,
 ) -> _PreparedPaddleRecognition:
     index, image_path, block, native_candidate = request
     image = opened_images.get(image_path)
@@ -865,7 +1088,7 @@ def _prepare_paddleocr_vl_recognition_from_cache(
             image = raw_image.convert("RGB")
         opened_images[image_path] = image
     crop = image.crop((block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)).convert("RGB")
-    inputs = _paddleocr_vl_inputs(processor, crop, _paddleocr_vl_prompt(block, prompt))
+    inputs = _paddleocr_vl_inputs(processor, crop, _paddleocr_vl_prompt(block, prompt), max_pixels)
     draft = _normalize_dflash_draft(native_candidate.text).strip() if native_candidate and native_candidate.text.strip() else ""
     return _PreparedPaddleRecognition(
         index=index,
@@ -882,6 +1105,7 @@ def _prepare_paddleocr_vl_batch(
     processor: object,
     group: list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]],
     prompt: str,
+    max_pixels: int | None = None,
 ) -> _PreparedPaddleBatch:
     from PIL import Image
 
@@ -896,7 +1120,7 @@ def _prepare_paddleocr_vl_batch(
                 opened_images[image_path] = image
             crops.append(image.crop((block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)))
         prompts = [_paddleocr_vl_prompt(block, prompt) for _, _, block, _ in group]
-        inputs = _paddleocr_vl_batch_inputs(processor, crops, prompts)
+        inputs = _paddleocr_vl_batch_inputs(processor, crops, prompts, max_pixels)
         return _PreparedPaddleBatch(group=group, inputs=inputs)
     finally:
         for image in opened_images.values():
@@ -906,7 +1130,152 @@ def _prepare_paddleocr_vl_batch(
                 pass
 
 
-def _paddleocr_vl_inputs(processor: object, image: object, prompt: str):
+def _prepare_paddleocr_vl_batch_from_cache(
+    processor: object,
+    group: list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]],
+    prompt: str,
+    opened_images: dict[Path, object],
+    max_pixels: int | None = None,
+) -> _PreparedPaddleBatch:
+    crops = []
+    for _index, image_path, block, _native_candidate in group:
+        image = opened_images.get(image_path)
+        if image is None:
+            from PIL import Image
+
+            with Image.open(image_path) as raw_image:
+                image = raw_image.convert("RGB")
+            opened_images[image_path] = image
+        crops.append(image.crop((block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)))
+    prompts = [_paddleocr_vl_prompt(block, prompt) for _, _, block, _ in group]
+    inputs = _paddleocr_vl_batch_inputs(processor, crops, prompts, max_pixels)
+    return _PreparedPaddleBatch(group=group, inputs=inputs)
+
+
+def _prepare_paddleocr_vl_dflash_batch_from_cache(
+    processor: object,
+    group: list[tuple[int, Path, LayoutBlock, NativeTextCandidate | None]],
+    prompt: str,
+    opened_images: dict[Path, object],
+    max_pixels: int | None = None,
+) -> _PreparedPaddleDflashBatch:
+    items: list[dict[str, object]] = []
+    drafts: list[str] = []
+    draft_ids: list[list[int]] = []
+    for _index, image_path, block, native_candidate in group:
+        image = opened_images.get(image_path)
+        if image is None:
+            from PIL import Image
+
+            with Image.open(image_path) as raw_image:
+                image = raw_image.convert("RGB")
+            opened_images[image_path] = image
+        crop = image.crop((block.bbox.x0, block.bbox.y0, block.bbox.x1, block.bbox.y1)).convert("RGB")
+        item_inputs = _paddleocr_vl_inputs(processor, crop, _paddleocr_vl_prompt(block, prompt), max_pixels)
+        draft = _normalize_dflash_draft(native_candidate.text).strip() if native_candidate and native_candidate.text.strip() else ""
+        items.append(item_inputs)
+        drafts.append(draft)
+        draft_ids.append(_tokenize_draft(getattr(processor, "tokenizer", processor), draft) if draft else [])
+    return _PreparedPaddleDflashBatch(group=group, inputs=items, drafts=drafts, draft_ids=draft_ids)
+
+
+def _stack_paddle_inputs(inputs: list[dict[str, object]]) -> dict[str, object]:
+    if not inputs:
+        return {}
+    import torch
+
+    keys = list(inputs[0].keys())
+    stacked: dict[str, object] = {}
+    for key in keys:
+        values = [item[key] for item in inputs if key in item]
+        if not values:
+            continue
+        first = values[0]
+        if hasattr(first, "shape"):
+            if key in {"input_ids", "attention_mask", "mm_token_type_ids"}:
+                tensors = [value.squeeze(0) if getattr(value, "ndim", 0) > 1 and value.shape[0] == 1 else value for value in values]
+                max_len = max(int(tensor.shape[-1]) for tensor in tensors)
+                pad_value = 0
+                padded = []
+                for tensor in tensors:
+                    pad = torch.full((max_len,), pad_value, dtype=tensor.dtype, device=tensor.device)
+                    pad[: int(tensor.shape[-1])] = tensor
+                    padded.append(pad)
+                stacked[key] = torch.stack(padded, dim=0)
+            elif key in {"pixel_values", "image_grid_thw"}:
+                tensors = [value for value in values]
+                stacked[key] = torch.cat(tensors, dim=0) if tensors[0].ndim >= 2 else torch.stack(tensors, dim=0)
+            else:
+                tensors = [value.squeeze(0) if getattr(value, "ndim", 0) > 1 and value.shape[0] == 1 else value for value in values]
+                rank = max(int(tensor.ndim) for tensor in tensors)
+                max_dims = [max(int(tensor.shape[dim]) for tensor in tensors) for dim in range(rank)]
+                batch = torch.zeros((len(tensors), *max_dims), dtype=tensors[0].dtype, device=tensors[0].device)
+                for index, tensor in enumerate(tensors):
+                    slices = (index,) + tuple(slice(0, int(tensor.shape[dim])) for dim in range(tensor.ndim))
+                    batch[slices] = tensor
+                stacked[key] = batch
+        else:
+            stacked[key] = values
+    return stacked
+
+
+def _append_batch_dflash_drafts(inputs: dict[str, object], drafts: list[str], tokenizer: object) -> tuple[dict[str, object], list[int]]:
+    import torch
+
+    if not drafts:
+        return inputs, [int(inputs["input_ids"].shape[-1])] * int(inputs["input_ids"].shape[0])
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask")
+    mm_token_type_ids = inputs.get("mm_token_type_ids")
+    batch_size = int(input_ids.shape[0])
+    prompt_lengths = (
+        [int(value) for value in attention_mask.sum(dim=-1).tolist()]
+        if attention_mask is not None
+        else [int(input_ids.shape[-1])] * batch_size
+    )
+    draft_ids_list = [_tokenize_draft(tokenizer, draft) for draft in drafts]
+    max_total_len = max(prompt_len + len(draft_ids) for prompt_len, draft_ids in zip(prompt_lengths, draft_ids_list))
+    pad_token_id = int(getattr(tokenizer, "pad_token_id", 0) or 0)
+    dtype = input_ids.dtype
+    device = input_ids.device
+    full_input_ids = torch.full((batch_size, max_total_len), pad_token_id, dtype=dtype, device=device)
+    full_attention = (
+        torch.zeros((batch_size, max_total_len), dtype=attention_mask.dtype, device=device)
+        if attention_mask is not None
+        else None
+    )
+    full_mm = (
+        torch.zeros((batch_size, max_total_len), dtype=mm_token_type_ids.dtype, device=device)
+        if mm_token_type_ids is not None
+        else None
+    )
+
+    for row, (prompt_len, draft_ids) in enumerate(zip(prompt_lengths, draft_ids_list)):
+        if prompt_len > 0:
+            full_input_ids[row, :prompt_len] = input_ids[row, :prompt_len]
+            if full_attention is not None:
+                full_attention[row, :prompt_len] = attention_mask[row, :prompt_len]
+            if full_mm is not None:
+                full_mm[row, :prompt_len] = mm_token_type_ids[row, :prompt_len]
+        if draft_ids:
+            draft_tensor = torch.tensor(draft_ids, dtype=dtype, device=device)
+            full_input_ids[row, prompt_len : prompt_len + len(draft_ids)] = draft_tensor
+            if full_attention is not None:
+                full_attention[row, prompt_len : prompt_len + len(draft_ids)] = 1
+            if full_mm is not None:
+                full_mm[row, prompt_len : prompt_len + len(draft_ids)] = 0
+
+    out = dict(inputs)
+    out["input_ids"] = full_input_ids
+    if full_attention is not None:
+        out["attention_mask"] = full_attention
+    if full_mm is not None:
+        out["mm_token_type_ids"] = full_mm
+    return out, prompt_lengths
+
+
+def _paddleocr_vl_inputs(processor: object, image: object, prompt: str, max_pixels: int | None = None):
     messages = [
         {
             "role": "user",
@@ -918,20 +1287,24 @@ def _paddleocr_vl_inputs(processor: object, image: object, prompt: str):
     ]
     apply_chat_template = getattr(processor, "apply_chat_template", None)
     if apply_chat_template is not None:
-        inputs = apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
+        kwargs = {
+            "tokenize": True,
+            "add_generation_prompt": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+        }
+        images_kwargs = _paddleocr_vl_images_kwargs(processor, max_pixels)
+        try:
+            inputs = apply_chat_template(messages, images_kwargs=images_kwargs, **kwargs)
+        except TypeError:
+            inputs = apply_chat_template(messages, **kwargs)
         return _ensure_mm_token_type_ids(processor, inputs)
     image_token = getattr(processor, "image_token", "<|IMAGE_PLACEHOLDER|>")
     inputs = processor(images=image, text=f"{image_token}{prompt}", return_tensors="pt")  # type: ignore[operator]
     return _ensure_mm_token_type_ids(processor, inputs)
 
 
-def _paddleocr_vl_batch_inputs(processor: object, images: list[object], prompts: list[str]):
+def _paddleocr_vl_batch_inputs(processor: object, images: list[object], prompts: list[str], max_pixels: int | None = None):
     apply_chat_template = getattr(processor, "apply_chat_template", None)
     if apply_chat_template is not None:
         messages = [
@@ -943,14 +1316,18 @@ def _paddleocr_vl_batch_inputs(processor: object, images: list[object], prompts:
                 ],
             }
             for image, prompt in zip(images, prompts)
-        ]
-        inputs = apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-        )
+            ]
+        kwargs = {
+            "tokenize": True,
+            "add_generation_prompt": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+        }
+        images_kwargs = _paddleocr_vl_images_kwargs(processor, max_pixels)
+        try:
+            inputs = apply_chat_template(messages, images_kwargs=images_kwargs, **kwargs)
+        except TypeError:
+            inputs = apply_chat_template(messages, **kwargs)
         return _ensure_mm_token_type_ids(processor, inputs)
     image_token = getattr(processor, "image_token", "<|IMAGE_PLACEHOLDER|>")
     try:
@@ -958,6 +1335,21 @@ def _paddleocr_vl_batch_inputs(processor: object, images: list[object], prompts:
     except TypeError:
         inputs = processor(images=images, text="\n".join(f"{image_token}{prompt}" for prompt in prompts), return_tensors="pt")  # type: ignore[operator]
     return _ensure_mm_token_type_ids(processor, inputs)
+
+
+def _paddleocr_vl_images_kwargs(processor: object, max_pixels: int | None = None) -> dict[str, dict[str, int]]:
+    image_processor = getattr(processor, "image_processor", None)
+    shortest_edge = getattr(image_processor, "min_pixels", None) if image_processor is not None else None
+    size: dict[str, int] = {}
+    if isinstance(shortest_edge, int):
+        size["shortest_edge"] = shortest_edge
+    if isinstance(max_pixels, int) and max_pixels > 0:
+        size["longest_edge"] = max_pixels
+    elif isinstance(getattr(image_processor, "max_pixels", None), int):
+        size["longest_edge"] = int(getattr(image_processor, "max_pixels"))
+    if not size:
+        return {}
+    return {"size": size}
 
 
 def _ensure_mm_token_type_ids(processor: object, inputs: object) -> object:
@@ -1235,10 +1627,21 @@ def _processor_inputs(processor: object, image: object, prompt: str) -> dict[str
 
 
 def _move_tensors(inputs: dict[str, object], device: str) -> dict[str, object]:
-    moved: dict[str, object] = {}
-    for key, value in inputs.items():
-        moved[key] = value.to(device) if hasattr(value, "to") else value
-    return moved
+    def _move(value: object) -> object:
+        if hasattr(value, "to"):
+            try:
+                return value.to(device)
+            except Exception:
+                return value
+        if isinstance(value, dict):
+            return {key: _move(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [_move(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(_move(item) for item in value)
+        return value
+
+    return {key: _move(value) for key, value in inputs.items()}
 
 
 def _model_device(model: object) -> str:
@@ -1246,6 +1649,11 @@ def _model_device(model: object) -> str:
         return str(next(model.parameters()).device)  # type: ignore[attr-defined]
     except Exception:
         return "cpu"
+
+
+def _requires_safe_paddleocr_vl_path(model: object) -> bool:
+    module_name = getattr(model.__class__, "__module__", "")
+    return "transformers.models.paddleocr_vl" in module_name or "PaddleOCR" in module_name or "paddleocr_vl" in module_name
 
 
 def _decode_generated(processor: object, generated_ids: object, output_ids: object) -> str:

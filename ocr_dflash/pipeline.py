@@ -16,7 +16,6 @@ from .layout import (
     detect_layout,
     should_use_native_text,
 )
-from .model_loader import load_transformers_vlm
 from .markdown_writer import write_markdown
 from .pdf_text import detect_pdf_text_line_blocks, extract_native_text_candidates_for_blocks, render_pdf_page_to_png
 from .schemas import (
@@ -57,6 +56,8 @@ class PipelineOptions:
     vlm_device: str = "auto"
     vlm_dtype: str = "auto"
     vlm_backend: Literal["auto", "transformers", "paddleocr-vl"] = "auto"
+    vlm_attn_implementation: str | None = None
+    vlm_max_pixels: int | None = None
     trust_remote_code: bool = True
     prompt: str = "Convert this document image region to Markdown."
 
@@ -124,6 +125,8 @@ def run_pdf_pipeline(options: PipelineOptions) -> PdfReport:
             "vlm_device": options.vlm_device,
             "vlm_dtype": options.vlm_dtype,
             "vlm_backend": options.vlm_backend,
+            "vlm_attn_implementation": options.vlm_attn_implementation,
+            "vlm_max_pixels": options.vlm_max_pixels,
             "layout_source": str(options.layout_json) if options.layout_json else options.layout_mode,
             "layout_device": options.layout_device,
             "layout_threshold": options.layout_threshold,
@@ -277,12 +280,16 @@ def _build_generator(options: PipelineOptions) -> BlockGenerator:
     if options.generator is not None:
         return options.generator
     if options.vlm_model is not None:
+        from .model_loader import load_transformers_vlm
+
         return load_transformers_vlm(
             options.vlm_model,
             device=options.vlm_device,
             dtype=options.vlm_dtype,
             trust_remote_code=options.trust_remote_code,
             backend=options.vlm_backend,
+            attn_implementation=options.vlm_attn_implementation,
+            max_pixels=options.vlm_max_pixels,
         )
     return NativeDraftGenerator()
 
@@ -312,6 +319,8 @@ def _page_options(options: PipelineOptions, page_index: int) -> PipelineOptions:
         vlm_device=options.vlm_device,
         vlm_dtype=options.vlm_dtype,
         vlm_backend=options.vlm_backend,
+        vlm_attn_implementation=options.vlm_attn_implementation,
+        vlm_max_pixels=options.vlm_max_pixels,
         trust_remote_code=options.trust_remote_code,
         prompt=options.prompt,
     )

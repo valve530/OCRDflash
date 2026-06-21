@@ -1,4 +1,5 @@
 from pathlib import Path
+import pytest
 
 from ocr_dflash.draft_verify import (
     WhitespaceTokenizer,
@@ -140,7 +141,7 @@ def test_draft_verifying_generator_reports_prefix_reject():
 
 
 def test_transformers_next_token_verifier_uses_last_logits():
-    import torch
+    torch = pytest.importorskip("torch")
 
     from ocr_dflash.transformers_verify import TransformersNextTokenVerifier
 
@@ -467,7 +468,7 @@ def test_paddleocr_vl_generator_reuses_image_for_direct_dflash(tmp_path):
         "paddleocr-vl:dflash:accepted",
         "paddleocr-vl:dflash:accepted",
     ]
-    assert model.calls >= 2
+    assert model.calls == 1
 
 
 def test_pipeline_batches_pending_vlm_requests_without_class_grouping(monkeypatch, tmp_path):
@@ -729,6 +730,32 @@ def test_generation_options_exposes_batch_max_pixels():
     assert GenerationOptions().batch_max_pixels == 0
 
 
+def test_model_loader_patches_paddleocr_vl_mask_compatibility(monkeypatch):
+    from ocr_dflash.model_loader import _patch_paddleocr_vl_compatibility
+    torch = pytest.importorskip("torch")
+
+    class FakeModule:
+        def __init__(self):
+            self.calls = []
+
+        def create_causal_mask(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            return kwargs
+
+    class FakeModel:
+        __module__ = "fake_module"
+
+    fake_module = FakeModule()
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fake_module", fake_module)
+    _patch_paddleocr_vl_compatibility(FakeModel())
+    input_embeds = torch.zeros((1, 2, 3))
+    result = fake_module.create_causal_mask(config=object(), inputs_embeds=input_embeds, past_key_values=None, cache_position=1)
+    assert fake_module.calls[0]["inputs_embeds"] is input_embeds
+    assert "cache_position" not in fake_module.calls[0]
+
+
 def test_paddleocr_layout_item_parsing_normalizes_dicts():
     from ocr_dflash.layout import _layout_block_from_paddleocr
 
@@ -799,7 +826,7 @@ class FakePaddleProcessor:
         self.decode_calls = 0
 
     def apply_chat_template(self, messages, tokenize, add_generation_prompt, return_dict, return_tensors):
-        import torch
+        torch = pytest.importorskip("torch")
 
         assert tokenize and add_generation_prompt and return_dict and return_tensors == "pt"
         self.last_messages = messages
@@ -822,7 +849,7 @@ class FakePaddleProcessor:
 
 class FakePaddleModel:
     def __init__(self, predictions, generated_suffix):
-        import torch
+        torch = pytest.importorskip("torch")
 
         self.predictions = list(predictions)
         self.generated_suffix = list(generated_suffix)
@@ -834,21 +861,32 @@ class FakePaddleModel:
         yield self.weight
 
     def __call__(self, **kwargs):
-        import torch
+        torch = pytest.importorskip("torch")
 
         input_ids = kwargs["input_ids"]
         past = kwargs.get("past_key_values")
         use_cache = kwargs.get("use_cache", False)
         logits_to_keep = int(kwargs.get("logits_to_keep", 0) or 0)
+        batch_size = int(input_ids.shape[0])
         seq_len = int(input_ids.shape[-1])
         self.calls += 1
 
         start = 0 if past is None else past.pred_index
         out_len = logits_to_keep if logits_to_keep > 0 else seq_len
-        logits = torch.zeros((1, out_len, 16))
-        for offset in range(out_len):
-            pred_index = min(start + offset, len(self.predictions) - 1)
-            logits[0, offset, self.predictions[pred_index]] = 1.0
+        logits = torch.zeros((batch_size, out_len, 16), dtype=torch.float32, device=input_ids.device)
+        if past is None and logits_to_keep == 0:
+            for row in range(batch_size):
+                for offset in range(out_len):
+                    if offset + 1 < seq_len:
+                        target = int(input_ids[row, offset + 1])
+                    else:
+                        target = self.predictions[min(offset, len(self.predictions) - 1)]
+                    logits[row, offset, target] = 1.0
+        else:
+            for row in range(batch_size):
+                for offset in range(out_len):
+                    pred_index = min(start + offset, len(self.predictions) - 1)
+                    logits[row, offset, self.predictions[pred_index]] = 1.0
         cache = past or FakeCache(seq_len, pred_index=0)
         if past is not None:
             cache.length += seq_len
@@ -856,16 +894,18 @@ class FakePaddleModel:
         return type("Out", (), {"logits": logits, "past_key_values": cache if use_cache else None})
 
     def generate(self, **kwargs):
-        import torch
+        torch = pytest.importorskip("torch")
 
         input_ids = kwargs["input_ids"]
+        batch_size = int(input_ids.shape[0])
         suffix = torch.tensor([self.generated_suffix], dtype=input_ids.dtype, device=input_ids.device)
+        suffix = suffix.expand(batch_size, -1)
         return torch.cat([input_ids, suffix], dim=-1)
 
 
 class FakeCache:
     def __init__(self, length, pred_index=0):
-        import torch
+        torch = pytest.importorskip("torch")
 
         self.length = length
         self.pred_index = pred_index

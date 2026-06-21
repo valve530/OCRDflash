@@ -48,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--vlm-backend", choices=["auto", "transformers", "paddleocr-vl"], default="auto")
     parse.add_argument("--vlm-device", default="auto")
     parse.add_argument("--vlm-dtype", default="auto", choices=["auto", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
+    parse.add_argument("--vlm-attn-implementation", default=None)
+    parse.add_argument("--vlm-max-pixels", type=int, default=None)
     parse.add_argument("--no-trust-remote-code", action="store_true")
     parse.add_argument("--prompt", default="Convert this document image region to Markdown.")
 
@@ -80,6 +82,8 @@ def build_parser() -> argparse.ArgumentParser:
     parse_pdf.add_argument("--vlm-backend", choices=["auto", "transformers", "paddleocr-vl"], default="auto")
     parse_pdf.add_argument("--vlm-device", default="auto")
     parse_pdf.add_argument("--vlm-dtype", default="auto", choices=["auto", "bf16", "bfloat16", "fp16", "float16", "fp32", "float32"])
+    parse_pdf.add_argument("--vlm-attn-implementation", default=None)
+    parse_pdf.add_argument("--vlm-max-pixels", type=int, default=None)
     parse_pdf.add_argument("--no-trust-remote-code", action="store_true")
     parse_pdf.add_argument("--prompt", default="Convert this document image region to Markdown.")
 
@@ -129,6 +133,8 @@ def main(argv: list[str] | None = None) -> None:
                 vlm_backend=args.vlm_backend,
                 vlm_device=args.vlm_device,
                 vlm_dtype=args.vlm_dtype,
+                vlm_attn_implementation=args.vlm_attn_implementation,
+                vlm_max_pixels=args.vlm_max_pixels,
                 trust_remote_code=not args.no_trust_remote_code,
                 prompt=args.prompt,
             )
@@ -158,6 +164,8 @@ def main(argv: list[str] | None = None) -> None:
                 vlm_backend=args.vlm_backend,
                 vlm_device=args.vlm_device,
                 vlm_dtype=args.vlm_dtype,
+                vlm_attn_implementation=args.vlm_attn_implementation,
+                vlm_max_pixels=args.vlm_max_pixels,
                 trust_remote_code=not args.no_trust_remote_code,
                 prompt=args.prompt,
             )

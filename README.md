@@ -92,10 +92,12 @@ uv run ocr-dflash parse-page \
   --pdf sample.pdf \
   --out-dir out/vlm \
   --layout-mode pdf-lines \
-  --vlm-model PaddlePaddle/PaddleOCR-VL \
+  --vlm-model ./models/PaddleOCR-VL-1.6 \
   --vlm-backend paddleocr-vl \
   --vlm-device auto \
   --vlm-dtype bf16 \
+  --vlm-attn-implementation flash_attention_2 \
+  --vlm-max-pixels 1003520 \
   --verify-native-text \
   --chunk-size 8 \
   --max-tokens 256
@@ -109,7 +111,7 @@ HTTP_PROXY=http://100.64.0.250:7890 \
 HTTPS_PROXY=http://100.64.0.250:7890 \
 ALL_PROXY=http://100.64.0.250:7890 \
 HF_HUB_DISABLE_XET=1 \
-uv run hf download PaddlePaddle/PaddleOCR-VL \
+uv run hf download PaddlePaddle/PaddleOCR-VL-1.6 \
   --include "model.safetensors" \
   --include "*.json" \
   --include "*.py" \
@@ -119,12 +121,12 @@ uv run hf download PaddlePaddle/PaddleOCR-VL \
 ```
 
 To keep the model inside the project instead of the global Hugging Face cache,
-add `--local-dir ./models/PaddleOCR-VL` and pass
-`--vlm-model ./models/PaddleOCR-VL` when running `parse-page`.
+add `--local-dir ./models/PaddleOCR-VL-1.6` and pass
+`--vlm-model ./models/PaddleOCR-VL-1.6` when running `parse-page`.
 
 Without `--vlm-model`, `parse-page` deliberately stays on the fast PDF native
 text baseline and no model is loaded. With `--vlm-backend paddleocr-vl`, the
-pipeline loads `PaddleOCRVLForConditionalGeneration`, formats the image prompt
+pipeline loads the PaddleOCR-VL remote-code model, formats the image prompt
 with the PaddleOCR-VL chat template, verifies PDF native text draft tokens, and
 falls back to VLM generation after the first mismatch for blocks that are not
 directly accepted. The PDF benchmark path now batches recognition across pages
@@ -132,8 +134,8 @@ after layout is prepared, so the VLM sees larger micro-batches. Use
 `--verify-native-text` to force direct-accept candidates through VLM/DFlash
 verification for ablations.
 
-The generic adapter uses `AutoProcessor` and `AutoModelForImageTextToText`
-first, then falls back to `AutoModelForCausalLM`.
+The PaddleOCR-VL path uses `AutoProcessor` and the model's remote-code
+`PaddleOCRVLForConditionalGeneration` class through `AutoModelForCausalLM`.
 
 For a real layout model instead of PDF text-line chunks:
 
@@ -143,7 +145,7 @@ uv run ocr-dflash parse-page \
   --out-dir out/layout-vlm \
   --layout-mode pp-doclayout-v2 \
   --layout-device gpu \
-  --vlm-model PaddlePaddle/PaddleOCR-VL \
+  --vlm-model PaddlePaddle/PaddleOCR-VL-1.6 \
   --vlm-backend paddleocr-vl
 ```
 
@@ -189,6 +191,21 @@ The implemented P0/P1 research scaffold includes:
 KV-cache chunk verification loop for greedy decoding when the model exposes
 `past_key_values`, and falls back to a correctness-first recompute verifier if a
 model backend cannot support cache-based verification.
+
+PaddleOCR-VL-1.6 follows the official Paddle stack:
+
+- `paddlepaddle-gpu==3.2.1`
+- `paddleocr[doc-parser]>=3.6.0`
+- `transformers>=5.0.0`
+
+The VLM path needs a small torch overlay in the same `.venv` on this machine:
+
+```sh
+uv pip install --python .venv/bin/python --no-deps --index-url https://download.pytorch.org/whl/cu128 \
+  torch==2.11.0+cu128 nvidia-nccl-cu12==2.28.9 nvidia-nvshmem-cu12==3.4.5
+```
+
+For a quick local debug run, use `demo.py`.
 
 ## Tests
 

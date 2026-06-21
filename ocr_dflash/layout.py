@@ -100,10 +100,18 @@ class PaddleOCRLayoutDetector(LayoutDetector):
         model_name: str = "PP-DocLayoutV2",
         device: str | None = None,
         threshold: float = 0.5,
+        img_size: int | None = None,
+        layout_nms: bool | None = None,
+        layout_unclip_ratio: float | None = None,
+        layout_merge_bboxes_mode: str | None = None,
     ):
         self.model_name = model_name
         self.device = device
         self.threshold = threshold
+        self.img_size = img_size
+        self.layout_nms = layout_nms
+        self.layout_unclip_ratio = layout_unclip_ratio
+        self.layout_merge_bboxes_mode = layout_merge_bboxes_mode
         self._model = None
 
     def detect(self, image_path: Path, image_size: tuple[int, int]) -> DetectionResult:
@@ -131,36 +139,30 @@ class PaddleOCRLayoutDetector(LayoutDetector):
         if self._model is not None:
             return self._model
         try:
-            import paddleocr
+            from paddleocr import LayoutDetection
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "PaddleOCR layout mode requires the optional `paddleocr` package. "
                 "Install it in the uv environment, or use `--layout-mode pdf-lines` / `--layout-json`."
             ) from exc
 
-        candidates = [
-            getattr(paddleocr, self.model_name.replace("-", "_"), None),
-            getattr(paddleocr, self.model_name, None),
-            getattr(paddleocr, "PPDocLayoutV2", None),
-            getattr(paddleocr, "LayoutDetection", None),
-            getattr(paddleocr, "PaddleOCR", None),
-        ]
-        cls = next((item for item in candidates if item is not None), None)
-        if cls is None:
-            raise RuntimeError(
-                f"installed paddleocr does not expose {self.model_name} / PPDocLayoutV2 layout APIs"
-            )
-
         kwargs: dict[str, object] = {}
+        if self.img_size is not None:
+            kwargs["img_size"] = self.img_size
+        if self.threshold is not None:
+            kwargs["threshold"] = self.threshold
+        if self.layout_nms is not None:
+            kwargs["layout_nms"] = self.layout_nms
+        if self.layout_unclip_ratio is not None:
+            kwargs["layout_unclip_ratio"] = self.layout_unclip_ratio
+        if self.layout_merge_bboxes_mode is not None:
+            kwargs["layout_merge_bboxes_mode"] = self.layout_merge_bboxes_mode
         if self.device:
             kwargs["device"] = self.device
-        if not self.device or self.device.startswith("cpu"):
-            kwargs["enable_mkldnn"] = False
-            kwargs["enable_cinn"] = False
-        try:
-            self._model = cls(**kwargs)
-        except TypeError:
-            self._model = cls()
+            if self.device.startswith("cpu"):
+                kwargs["enable_mkldnn"] = False
+                kwargs["enable_cinn"] = False
+        self._model = LayoutDetection(model_name=self.model_name, **kwargs)
         return self._model
 
 
@@ -200,6 +202,15 @@ def _run_paddleocr_layout_model(model: object, image_path: Path) -> list[Any]:
                 items.extend(extracted if extracted else [value])
             elif isinstance(value, list):
                 items.extend(value)
+            elif hasattr(value, "json"):
+                try:
+                    extracted = value.json
+                    if isinstance(extracted, dict):
+                        items.extend(_extract_layout_items(extracted) or [extracted])
+                    else:
+                        items.append(extracted)
+                except Exception:
+                    items.append(value)
             else:
                 items.append(value)
         return items
