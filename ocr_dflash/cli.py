@@ -14,6 +14,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ocr-dflash")
     parser.add_argument("--pdf", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=Path("tmp/ocr_dflash_out"))
+    parser.add_argument("--page", type=int, default=None)
     parser.add_argument("--mode", choices=["dflash", "baseline"], default="dflash")
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--chunk-size", type=int, default=8)
@@ -21,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--layout-model-dir", type=Path, default=Path("models/PP-DocLayoutV3"))
     parser.add_argument("--vlm-model", type=Path, default=Path("models/PaddleOCR-VL-1.6"))
     parser.add_argument("--max-pixels", type=int, default=1280 * 28 * 28)
+    parser.add_argument("--table-native-draft", action="store_true")
     parser.add_argument("--proxy", default=None)
     return parser
 
@@ -32,6 +34,7 @@ def main(argv: list[str] | None = None) -> None:
         SimpleOptions(
             pdf=args.pdf,
             out_dir=args.out_dir,
+            page=args.page,
             dpi=args.dpi,
             layout_model_dir=args.layout_model_dir,
             vlm_model=args.vlm_model,
@@ -39,6 +42,7 @@ def main(argv: list[str] | None = None) -> None:
             max_tokens=args.max_tokens,
             chunk_size=args.chunk_size,
             max_pixels=args.max_pixels,
+            table_native_draft=args.table_native_draft,
         )
     )
     copy_pdf_outputs(report, args.out_dir)

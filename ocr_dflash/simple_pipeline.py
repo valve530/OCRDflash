@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 from .io_utils import ensure_dir, write_json
 from .layout import PaddleOCRLayoutDetector, detect_layout, should_use_native_text
@@ -21,12 +23,14 @@ from .schemas import (
     RenderedPage,
 )
 from .simple_vlm import PaddleOCRVLRunner
+from .table_native import table_draft_from_pdf
 
 
 @dataclass(slots=True)
 class SimpleOptions:
     pdf: Path
     out_dir: Path = Path("tmp/simple_out")
+    page: int | None = None
     dpi: int = 200
     layout_model_dir: Path = Path("models/PP-DocLayoutV3")
     vlm_model: Path = Path("models/PaddleOCR-VL-1.6")
@@ -34,6 +38,7 @@ class SimpleOptions:
     max_tokens: int = 512
     chunk_size: int = 8
     max_pixels: int = 1280 * 28 * 28
+    table_native_draft: bool = False
 
 
 @dataclass(slots=True)
@@ -62,14 +67,20 @@ def run_pdf(options: SimpleOptions) -> PdfReport:
         layout_nms=True,
     )
 
-    prepared = [
-        prepare_page(options, page_index, out_dir / f"page_{page_index:04}", layout_detector)
-        for page_index in range(len(doc))
-    ]
+    page_indexes = [options.page] if options.page is not None else list(range(len(doc)))
+    with progress_bar("layout/native", len(page_indexes)) as progress:
+        prepared = []
+        for page_index in page_indexes:
+            prepared.append(
+                prepare_page(options, page_index, out_dir / f"page_{page_index:04}", layout_detector)
+            )
+            progress.update(f"page {page_index}")
 
     reset_cuda_peak_memory_stats()
     runner = PaddleOCRVLRunner(options.vlm_model, device="cuda", dtype="bf16", max_pixels=options.max_pixels)
-    reports = [recognize_page(options, page, runner, started) for page in prepared]
+    total_blocks = sum(len(page.layout.blocks) for page in prepared)
+    with progress_bar(f"vlm/{options.mode}", total_blocks) as progress:
+        reports = [recognize_page(options, page, runner, started, progress=progress) for page in prepared]
     peak_vram_mb, current_vram_mb = cuda_memory_stats()
     report = PdfReport(
         schema_version=1,
@@ -142,6 +153,7 @@ def recognize_page(
     prepared: PreparedPage,
     runner: PaddleOCRVLRunner,
     started_total: float,
+    progress: "ProgressAdapter | None" = None,
 ) -> PageReport:
     from PIL import Image
 
@@ -156,13 +168,22 @@ def recognize_page(
             crop_path = crops_dir / f"block_{index + 1:04}.png"
             crop = crop_image(image, block, crop_path)
             try:
+                draft_text = native.text if native else None
+                if options.table_native_draft and block.class_name == "table":
+                    draft_text = table_draft_from_pdf(
+                        options.pdf,
+                        prepared.page,
+                        options.dpi,
+                        prepared.rendered.height,
+                        block,
+                    ) or draft_text
                 if options.mode == "baseline":
                     result = runner.generate(crop, block.class_name, max_new_tokens=options.max_tokens)
                 else:
                     result = runner.dflash_generate(
                         crop,
                         block.class_name,
-                        native.text if native else None,
+                        draft_text,
                         chunk_size=options.chunk_size,
                         max_new_tokens=options.max_tokens,
                     )
@@ -185,7 +206,7 @@ def recognize_page(
                     label=block.label,
                     score=block.score,
                     bbox=block.bbox,
-                    native_text_draft=native.text if native else None,
+                    native_text_draft=draft_text,
                     native_text_quality=native.quality if native else None,
                     native_text=None,
                     recognition=recognition,
@@ -193,6 +214,8 @@ def recognize_page(
                     crop=str(crop_path),
                 )
             )
+            if progress is not None:
+                progress.update(f"p{prepared.page} b{index + 1}/{len(prepared.layout.blocks)} {block.class_name}")
 
     markdown_path = page_dir / "page.md"
     write_markdown(
@@ -335,3 +358,75 @@ def reset_cuda_peak_memory_stats() -> None:
         return
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+
+
+class ProgressAdapter:
+    def update(self, description: str | None = None) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return None
+
+
+@contextmanager
+def progress_bar(label: str, total: int) -> Iterator[ProgressAdapter]:
+    try:
+        from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+    except Exception:
+        progress = TqdmProgress(label, total)
+        try:
+            yield progress
+        finally:
+            progress.close()
+        return
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task_id = progress.add_task(label, total=total)
+        yield RichProgress(progress, task_id, label)
+
+
+class RichProgress(ProgressAdapter):
+    def __init__(self, progress: object, task_id: object, label: str):
+        self.progress = progress
+        self.task_id = task_id
+        self.label = label
+
+    def update(self, description: str | None = None) -> None:
+        self.progress.update(
+            self.task_id,
+            advance=1,
+            description=f"{self.label}: {description}" if description else self.label,
+        )
+
+
+class TqdmProgress(ProgressAdapter):
+    def __init__(self, label: str, total: int):
+        self.label = label
+        self._bar = None
+        try:
+            from tqdm import tqdm
+
+            self._bar = tqdm(total=total, desc=label)
+        except Exception:
+            print(f"{label}: 0/{total}")
+            self.count = 0
+            self.total = total
+
+    def update(self, description: str | None = None) -> None:
+        if self._bar is not None:
+            if description:
+                self._bar.set_description(f"{self.label}: {description}")
+            self._bar.update(1)
+            return
+        self.count += 1
+        print(f"{self.label}: {self.count}/{self.total} {description or ''}")
+
+    def close(self) -> None:
+        if self._bar is not None:
+            self._bar.close()

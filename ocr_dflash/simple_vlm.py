@@ -1,9 +1,12 @@
 from __future__ import annotations
-import torch
+
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
+
+import torch
 
 from ocr_dflash.schemas import DraftVerificationStats
 
@@ -28,6 +31,16 @@ DEBUG_MODEL = Path("models/PaddleOCR-VL-1.6")
 DEBUG_TASK = "doc_title"
 DEBUG_MODE = "dflash"
 DEBUG_DRAFT = "Attention Is All You Need"
+
+THE_FIRST_LIGATURE_RE = re.compile(r"\btheﬁrst\b")
+BEEN_FIRMLY_LIGATURE_RE = re.compile(r"\bbeenﬁrmly\b")
+CITATION_RE = re.compile(r"\s*\[(\d+(?:\s*,\s*\d+)*)\]\s*")
+PUNCT_NO_SPACE_RE = re.compile(r"(?<=[A-Za-z0-9\]\)])([,;:])(?=[A-Za-z0-9])")
+SENTENCE_NO_SPACE_RE = re.compile(r"(?<=[A-Za-z\]\)])\.(?=[A-Z])")
+INITIAL_SPLIT_RE = re.compile(r"(?<=\b[A-Z])\.\s+(?=[A-Z][a-z])")
+PAREN_NO_SPACE_RE = re.compile(r"(?<=[A-Za-z0-9])\((?=[A-Za-z0-9])")
+SUPERSCRIPT_NO_SPACE_RE = re.compile(r"((?:\\\(\^\{[^}]+}\))+)(?=[A-Z])")
+MULTISPACE_RE = re.compile(r" {2,}")
 
 
 @dataclass(slots=True)
@@ -144,11 +157,9 @@ class PaddleOCRVLRunner:
 
         checked = 0
         accepted = 0
-        generated: list[int] = []
         with torch.no_grad():
             try:
                 logits, cache = self._prefill(inputs)
-                base_cache_len = cache_seq_length(cache)
                 for chunk in split_chunks(self.tokenizer, draft_ids, chunk_size):
                     chunk_outputs = self._forward_ids(chunk, cache, inputs["input_ids"])
                     predicted = chunk_predictions(logits, chunk_outputs.logits)
@@ -389,22 +400,23 @@ def normalize_dflash_draft(text: str) -> str:
 
 
 def canonicalize_vlm_draft(text: str) -> str:
+    text = THE_FIRST_LIGATURE_RE.sub("the first", text)
+    text = BEEN_FIRMLY_LIGATURE_RE.sub("been firmly", text)
     text = (
         text.replace("∗", r"\(^{*}\)")
         .replace("†", r"\(^{\dagger}\)")
         .replace("‡", r"\(^{\ddagger}\)")
-        .replace("ﬁ", "fi")
-        .replace("ﬂ", "fl")
+        .replace("Ł", "L")
+        .replace("ł", "l")
     )
-    text = re.sub(
-        r"\s*\[(\d+(?:\s*,\s*\d+)*)\]\s*",
-        lambda m: rf" \([{m.group(1).replace(' ', '')}]\) ",
-        text,
-    )
-    text = re.sub(r"(?<=[A-Za-z0-9\]\)])([,;:])(?=[A-Za-z0-9])", r"\1 ", text)
-    text = re.sub(r"(?<=[A-Za-z\]\)])\.(?=[A-Z])", ". ", text)
-    text = re.sub(r"(?<=[A-Za-z0-9])\((?=[A-Za-z0-9])", " (", text)
-    return re.sub(r" {2,}", " ", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = CITATION_RE.sub(lambda m: f" [{m.group(1).replace(' ', '')}] ", text)
+    text = PUNCT_NO_SPACE_RE.sub(r"\1 ", text)
+    text = SENTENCE_NO_SPACE_RE.sub(". ", text)
+    text = INITIAL_SPLIT_RE.sub(". ", text)
+    text = PAREN_NO_SPACE_RE.sub(" (", text)
+    text = SUPERSCRIPT_NO_SPACE_RE.sub(r"\1 ", text)
+    return MULTISPACE_RE.sub(" ", text)
 
 
 def should_drop_space(prev: str | None, next_: str | None) -> bool:
