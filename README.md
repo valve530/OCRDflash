@@ -16,6 +16,15 @@ artifact shape used by `/home/valve/flash-doc-rs`:
 uv sync --dev
 ```
 
+For the VLM overlay on this machine:
+
+```sh
+HTTP_PROXY=http://100.64.0.250:7890 \
+HTTPS_PROXY=http://100.64.0.250:7890 \
+ALL_PROXY=http://100.64.0.250:7890 \
+uv sync --dev --no-default-groups --group vlm
+```
+
 If the network is restricted, use the local proxy:
 
 ```sh
@@ -198,11 +207,14 @@ PaddleOCR-VL-1.6 follows the official Paddle stack:
 - `paddleocr[doc-parser]>=3.6.0`
 - `transformers>=5.0.0`
 
-The VLM path needs a small torch overlay in the same `.venv` on this machine:
+The VLM path needs a small torch overlay in the same `.venv` on this machine.
+Use `uv add` so the environment stays reproducible:
 
 ```sh
-uv pip install --python .venv/bin/python --no-deps --index-url https://download.pytorch.org/whl/cu128 \
-  torch==2.11.0+cu128 nvidia-nccl-cu12==2.28.9 nvidia-nvshmem-cu12==3.4.5
+HTTP_PROXY=http://100.64.0.250:7890 \
+HTTPS_PROXY=http://100.64.0.250:7890 \
+ALL_PROXY=http://100.64.0.250:7890 \
+uv add --group vlm
 ```
 
 For a quick local debug run, use `demo.py`.

@@ -32,7 +32,7 @@ def load_transformers_vlm(
     if device == "auto":
         kwargs["device_map"] = "auto"
 
-    model_classes = [AutoModelForCausalLM, AutoModelForImageTextToText] if use_dflash else [AutoModelForImageTextToText, AutoModelForCausalLM]
+    model_classes = [AutoModelForImageTextToText, AutoModelForCausalLM]
 
     errors: list[str] = []
     for cls in model_classes:
@@ -51,6 +51,7 @@ def load_transformers_vlm(
 
 
 def _patch_paddleocr_vl_compatibility(model: object) -> None:
+    _patch_paddleocr_vl_prepare_inputs(model)
     module_name = getattr(model.__class__, "__module__", "")
     module = sys.modules.get(module_name)
     if module is None or not hasattr(module, "create_causal_mask"):
@@ -78,6 +79,35 @@ def _patch_paddleocr_vl_compatibility(model: object) -> None:
             setattr(module_obj, "create_causal_mask", _compat_create_causal_mask)
     except Exception:
         pass
+
+
+def _patch_paddleocr_vl_prepare_inputs(model: object) -> None:
+    original = getattr(model, "prepare_inputs_for_generation", None)
+    if original is None or getattr(original, "__name__", "") == "_compat_prepare_inputs_for_generation":
+        return
+
+    def _compat_prepare_inputs_for_generation(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except TypeError as exc:
+            if "NoneType" not in str(exc) or "subscriptable" not in str(exc):
+                raise
+            input_ids = args[0] if args else kwargs.get("input_ids")
+            if input_ids is None:
+                raise
+            try:
+                import torch
+
+                kwargs["cache_position"] = torch.arange(
+                    int(input_ids.shape[-1]),
+                    device=input_ids.device,
+                    dtype=torch.long,
+                )
+            except Exception:
+                raise exc
+            return original(*args, **kwargs)
+
+    setattr(model, "prepare_inputs_for_generation", _compat_prepare_inputs_for_generation)
 
 
 def _patch_paddleocr_vl_rope_alias() -> None:

@@ -998,13 +998,6 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
     def _generate(self, inputs: dict[str, object], options: GenerationOptions):
         import torch
 
-        if not options.sampling:
-            try:
-                return self._generate_with_cache(inputs, options.max_tokens)
-            except (AttributeError, TypeError, RuntimeError) as exc:
-                if not _should_fallback_from_cache_error(exc):
-                    raise
-
         kwargs = {
             "max_new_tokens": options.max_tokens,
             "do_sample": options.sampling,
@@ -1012,7 +1005,7 @@ class PaddleOCRVLDFlashGenerator(BlockGenerator):
         if options.sampling:
             kwargs["temperature"] = options.temperature
         with torch.no_grad():
-            return self.model.generate(**inputs, **kwargs)  # type: ignore[attr-defined]
+            return self.model.generate(**_generation_inputs(inputs), **kwargs)  # type: ignore[attr-defined]
 
     def _generate_with_cache(self, inputs: dict[str, object], max_tokens: int):
         import torch
@@ -1617,6 +1610,12 @@ def _trim_prompt_ids(output_ids: object, inputs: dict[str, object]) -> object:
     if prompt_len and hasattr(output_ids, "ndim") and output_ids.ndim == 2:
         return output_ids[:, prompt_len:]
     return output_ids
+
+
+def _generation_inputs(inputs: dict[str, object]) -> dict[str, object]:
+    out = dict(inputs)
+    out.pop("mm_token_type_ids", None)
+    return out
 
 
 def _processor_inputs(processor: object, image: object, prompt: str) -> dict[str, object]:
