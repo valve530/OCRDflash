@@ -156,6 +156,8 @@ class DraftVerificationStats:
     rollback_tokens: int
     generated_tokens: int
     chunk_size: int
+    reference_matches: int = 0
+    reference_misses: int = 0
 
 
 @dataclass(slots=True)

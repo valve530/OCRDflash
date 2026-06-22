@@ -31,6 +31,10 @@ DEBUG_MODEL = Path("models/PaddleOCR-VL-1.6")
 DEBUG_TASK = "doc_title"
 DEBUG_MODE = "dflash"
 DEBUG_DRAFT = "Attention Is All You Need"
+DEFAULT_REFERENCE_WINDOW = 3
+MIN_REFERENCE_WINDOW = 2
+MAX_REFERENCE_MISSES = 2
+MAX_REFERENCE_MATCHES = 2
 
 THE_FIRST_LIGATURE_RE = re.compile(r"\btheﬁrst\b")
 BEEN_FIRMLY_LIGATURE_RE = re.compile(r"\bbeenﬁrmly\b")
@@ -157,10 +161,23 @@ class PaddleOCRVLRunner:
 
         checked = 0
         accepted = 0
+        output_ids: list[int] = []
+        reference_matches = 0
+        reference_misses = 0
         with torch.no_grad():
             try:
                 logits, cache = self._prefill(inputs)
-                for chunk in split_chunks(self.tokenizer, draft_ids, chunk_size):
+                draft_pos = 0
+                while len(output_ids) < max_new_tokens:
+                    chunk = reference_chunk(
+                        draft_ids,
+                        output_ids,
+                        draft_pos,
+                        chunk_size,
+                        DEFAULT_REFERENCE_WINDOW,
+                    )
+                    if not chunk:
+                        break
                     chunk_outputs = self._forward_ids(chunk, cache, inputs["input_ids"])
                     predicted = chunk_predictions(logits, chunk_outputs.logits)
                     matched = 0
@@ -169,42 +186,138 @@ class PaddleOCRVLRunner:
                         if actual != expected:
                             break
                         matched += 1
-                    accepted += matched
+
+                    if matched:
+                        output_ids.extend(chunk[:matched])
+                        accepted += matched
+                        draft_pos = find_after_subsequence(draft_ids, output_ids) or (
+                            draft_pos + matched
+                        )
                     if matched == len(chunk):
                         logits = chunk_outputs.logits
                         cache = chunk_outputs.past_key_values
                         continue
 
+                    aligned_pos = find_reference_position(
+                        draft_ids,
+                        output_ids,
+                        DEFAULT_REFERENCE_WINDOW,
+                        min_after=draft_pos + 1,
+                    )
+                    if aligned_pos is None:
+                        reference_misses += 1
+                        if reference_misses >= MAX_REFERENCE_MISSES:
+                            suffix_ids, suffix = self._generate_suffix(
+                                inputs,
+                                output_ids,
+                                max_new_tokens - len(output_ids),
+                            )
+                            suffix_list = tensor_to_ids(suffix_ids)
+                            stats = DraftVerificationStats(
+                                mode="dflash_llma_reference",
+                                accepted=False,
+                                prefix_accepted=accepted > 0,
+                                draft_tokens=len(draft_ids),
+                                checked_tokens=checked,
+                                matched_tokens=accepted,
+                                accepted_tokens=accepted,
+                                rejected_tokens=max(0, len(draft_ids) - accepted),
+                                rollback_tokens=reference_misses,
+                                generated_tokens=len(suffix_list),
+                                chunk_size=max(1, chunk_size),
+                                reference_matches=reference_matches,
+                                reference_misses=reference_misses,
+                            )
+                            return VlmResult(
+                                text=decode_token_ids(
+                                    self.tokenizer,
+                                    output_ids + suffix_list,
+                                ),
+                                backend="dflash:llma-prefix"
+                                if accepted
+                                else "dflash:fallback-generate",
+                                ms=(time.perf_counter() - started) * 1000.0,
+                                tokens=len(output_ids) + len(suffix_list),
+                                draft=stats,
+                            )
+                        continue
+
+                    reference_matches += 1
+                    reference_misses = 0
+                    draft_pos = aligned_pos
+                    if reference_matches >= MAX_REFERENCE_MATCHES:
+                        suffix_ids, suffix = self._generate_suffix(
+                            inputs,
+                            output_ids,
+                            max_new_tokens - len(output_ids),
+                        )
+                        suffix_list = tensor_to_ids(suffix_ids)
+                        stats = DraftVerificationStats(
+                            mode="dflash_llma_reference",
+                            accepted=False,
+                            prefix_accepted=accepted > 0,
+                            draft_tokens=len(draft_ids),
+                            checked_tokens=checked,
+                            matched_tokens=accepted,
+                            accepted_tokens=accepted,
+                            rejected_tokens=max(0, len(draft_ids) - accepted),
+                            rollback_tokens=reference_misses,
+                            generated_tokens=len(suffix_list),
+                            chunk_size=max(1, chunk_size),
+                            reference_matches=reference_matches,
+                            reference_misses=reference_misses,
+                        )
+                        return VlmResult(
+                            text=decode_token_ids(
+                                self.tokenizer,
+                                output_ids + suffix_list,
+                            ),
+                            backend="dflash:llma-prefix"
+                            if accepted
+                            else "dflash:fallback-generate",
+                            ms=(time.perf_counter() - started) * 1000.0,
+                            tokens=len(output_ids) + len(suffix_list),
+                            draft=stats,
+                        )
+
+                fully_accepted = accepted == len(draft_ids) and output_ids == draft_ids
+                if not fully_accepted and len(output_ids) < max_new_tokens:
                     suffix_ids, suffix = self._generate_suffix(
                         inputs,
-                        draft_ids[:accepted],
-                        max_new_tokens,
+                        output_ids,
+                        max_new_tokens - len(output_ids),
                     )
-                    stats = DraftVerificationStats(
-                        mode="dflash_cache_verify",
-                        accepted=False,
-                        prefix_accepted=accepted > 0,
-                        draft_tokens=len(draft_ids),
-                        checked_tokens=checked,
-                        matched_tokens=accepted,
-                        accepted_tokens=accepted,
-                        rejected_tokens=len(draft_ids) - accepted,
-                        rollback_tokens=1,
-                        generated_tokens=int(suffix_ids.shape[-1]),
-                        chunk_size=max(1, chunk_size),
-                    )
-                    return VlmResult(
-                        text=decode_token_ids(
-                            self.tokenizer,
-                            draft_ids[:accepted] + tensor_to_ids(suffix_ids),
-                        ),
-                        backend="dflash:prefix"
-                        if accepted
-                        else "dflash:fallback-generate",
-                        ms=(time.perf_counter() - started) * 1000.0,
-                        tokens=accepted + int(suffix_ids.shape[-1]),
-                        draft=stats,
-                    )
+                    suffix_list = tensor_to_ids(suffix_ids)
+                    text_ids = output_ids + suffix_list
+                    generated_tokens = len(suffix_list)
+                else:
+                    text_ids = output_ids
+                    generated_tokens = 0
+
+                stats = DraftVerificationStats(
+                    mode="dflash_llma_reference",
+                    accepted=fully_accepted,
+                    prefix_accepted=accepted > 0,
+                    draft_tokens=len(draft_ids),
+                    checked_tokens=checked,
+                    matched_tokens=accepted,
+                    accepted_tokens=accepted,
+                    rejected_tokens=0 if fully_accepted else max(0, len(draft_ids) - accepted),
+                    rollback_tokens=reference_misses,
+                    generated_tokens=generated_tokens,
+                    chunk_size=max(1, chunk_size),
+                    reference_matches=reference_matches,
+                    reference_misses=reference_misses,
+                )
+                return VlmResult(
+                    text=draft if fully_accepted else decode_token_ids(self.tokenizer, text_ids),
+                    backend="dflash:accepted"
+                    if fully_accepted
+                    else ("dflash:llma-prefix" if accepted else "dflash:fallback-generate"),
+                    ms=(time.perf_counter() - started) * 1000.0,
+                    tokens=len(text_ids),
+                    draft=stats,
+                )
             except Exception:
                 return self._dflash_recompute(
                     inputs,
@@ -460,6 +573,63 @@ def split_chunks(
         chunks.append(draft_ids[start:end])
         start = end
     return chunks
+
+
+def reference_chunk(
+    draft_ids: list[int],
+    output_ids: list[int],
+    draft_pos: int,
+    chunk_size: int,
+    window: int,
+) -> list[int]:
+    chunk_size = max(1, chunk_size)
+    if not output_ids:
+        return draft_ids[:chunk_size]
+
+    aligned_pos = find_reference_position(draft_ids, output_ids, window)
+    start = aligned_pos if aligned_pos is not None else draft_pos
+    start = min(max(0, start), len(draft_ids))
+    return draft_ids[start : start + chunk_size]
+
+
+def find_reference_position(
+    draft_ids: list[int],
+    output_ids: list[int],
+    max_window: int,
+    min_after: int = 0,
+) -> int | None:
+    largest = min(max(1, max_window), len(output_ids))
+    smallest = min(MIN_REFERENCE_WINDOW, largest)
+    for window in range(largest, smallest - 1, -1):
+        aligned_pos = find_after_subsequence(
+            draft_ids,
+            output_ids[-window:],
+            min_after=min_after,
+        )
+        if aligned_pos is not None:
+            return aligned_pos
+    return None
+
+
+def find_after_subsequence(
+    haystack: list[int],
+    needle: list[int],
+    min_after: int = 0,
+) -> int | None:
+    if not needle:
+        return 0
+    if len(needle) > len(haystack):
+        return None
+    matched: int | None = None
+    for start in range(0, len(haystack) - len(needle) + 1):
+        after = start + len(needle)
+        if after < min_after:
+            continue
+        if haystack[start : start + len(needle)] == needle:
+            if matched is not None:
+                return None
+            matched = after
+    return matched
 
 
 def is_special_chunk_token(tokenizer: object, token_id: int) -> bool:

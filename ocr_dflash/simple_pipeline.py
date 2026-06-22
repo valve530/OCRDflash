@@ -286,6 +286,8 @@ def page_stats(blocks: list[PageDemoBlock]) -> dict[str, float | int]:
     accepted_tokens = 0
     rejected_tokens = 0
     generated_tokens = 0
+    reference_matches = 0
+    reference_misses = 0
     accepted_blocks = 0
     prefix_blocks = 0
     fallback_blocks = 0
@@ -303,6 +305,8 @@ def page_stats(blocks: list[PageDemoBlock]) -> dict[str, float | int]:
         accepted_tokens += stats.accepted_tokens
         rejected_tokens += stats.rejected_tokens
         generated_tokens += stats.generated_tokens
+        reference_matches += stats.reference_matches
+        reference_misses += stats.reference_misses
         if stats.accepted:
             accepted_blocks += 1
         elif stats.prefix_accepted:
@@ -316,6 +320,8 @@ def page_stats(blocks: list[PageDemoBlock]) -> dict[str, float | int]:
         "accepted_tokens": accepted_tokens,
         "rejected_tokens": rejected_tokens,
         "generated_tokens": generated_tokens,
+        "reference_matches": reference_matches,
+        "reference_misses": reference_misses,
         "accepted_token_ratio": accepted_tokens / draft_tokens if draft_tokens else 0.0,
         "direct_accept_blocks": accepted_blocks,
         "prefix_accept_blocks": prefix_blocks,
@@ -326,12 +332,16 @@ def page_stats(blocks: list[PageDemoBlock]) -> dict[str, float | int]:
 def pdf_stats(reports: list[PageReport]) -> dict[str, float | int]:
     draft_tokens = sum(report.stats.get("draft_tokens", 0) for report in reports)
     accepted_tokens = sum(report.stats.get("accepted_tokens", 0) for report in reports)
+    reference_matches = sum(report.stats.get("reference_matches", 0) for report in reports)
+    reference_misses = sum(report.stats.get("reference_misses", 0) for report in reports)
     return {
         "page_count": len(reports),
         "block_count": sum(report.block_count for report in reports),
         "draft_tokens": draft_tokens,
         "accepted_tokens": accepted_tokens,
         "accepted_token_ratio": accepted_tokens / draft_tokens if draft_tokens else 0.0,
+        "reference_matches": reference_matches,
+        "reference_misses": reference_misses,
         "direct_accept_blocks": sum(report.stats.get("direct_accept_blocks", 0) for report in reports),
         "prefix_accept_blocks": sum(report.stats.get("prefix_accept_blocks", 0) for report in reports),
         "fallback_blocks": sum(report.stats.get("fallback_blocks", 0) for report in reports),
