@@ -30,7 +30,7 @@ DEBUG_IMAGE = Path("tmp/simple_dflash_run4/page_0000/crops/block_0001.png")
 DEBUG_MODEL = Path("models/PaddleOCR-VL-1.6")
 DEBUG_TASK = "doc_title"
 DEBUG_MODE = "dflash"
-DEBUG_DRAFT = "Attention Is All You Need"
+DEBUG_DRAFT = "Attention is All You Need"
 DEFAULT_REFERENCE_WINDOW = 3
 MIN_REFERENCE_WINDOW = 2
 MAX_REFERENCE_MISSES = 2
@@ -229,9 +229,8 @@ class PaddleOCRVLRunner:
                                 reference_misses=reference_misses,
                             )
                             return VlmResult(
-                                text=decode_token_ids(
-                                    self.tokenizer,
-                                    output_ids + suffix_list,
+                                text=join_decoded_prefix_and_suffix(
+                                    self.tokenizer, output_ids, suffix
                                 ),
                                 backend="dflash:llma-prefix"
                                 if accepted
@@ -268,9 +267,8 @@ class PaddleOCRVLRunner:
                             reference_misses=reference_misses,
                         )
                         return VlmResult(
-                            text=decode_token_ids(
-                                self.tokenizer,
-                                output_ids + suffix_list,
+                            text=join_decoded_prefix_and_suffix(
+                                self.tokenizer, output_ids, suffix
                             ),
                             backend="dflash:llma-prefix"
                             if accepted
@@ -289,9 +287,15 @@ class PaddleOCRVLRunner:
                     )
                     suffix_list = tensor_to_ids(suffix_ids)
                     text_ids = output_ids + suffix_list
+                    text = join_decoded_prefix_and_suffix(
+                        self.tokenizer, output_ids, suffix
+                    )
                     generated_tokens = len(suffix_list)
                 else:
                     text_ids = output_ids
+                    text = draft if fully_accepted else decode_token_ids(
+                        self.tokenizer, output_ids
+                    )
                     generated_tokens = 0
 
                 stats = DraftVerificationStats(
@@ -302,7 +306,9 @@ class PaddleOCRVLRunner:
                     checked_tokens=checked,
                     matched_tokens=accepted,
                     accepted_tokens=accepted,
-                    rejected_tokens=0 if fully_accepted else max(0, len(draft_ids) - accepted),
+                    rejected_tokens=0
+                    if fully_accepted
+                    else max(0, len(draft_ids) - accepted),
                     rollback_tokens=reference_misses,
                     generated_tokens=generated_tokens,
                     chunk_size=max(1, chunk_size),
@@ -310,10 +316,12 @@ class PaddleOCRVLRunner:
                     reference_misses=reference_misses,
                 )
                 return VlmResult(
-                    text=draft if fully_accepted else decode_token_ids(self.tokenizer, text_ids),
+                    text=text,
                     backend="dflash:accepted"
                     if fully_accepted
-                    else ("dflash:llma-prefix" if accepted else "dflash:fallback-generate"),
+                    else (
+                        "dflash:llma-prefix" if accepted else "dflash:fallback-generate"
+                    ),
                     ms=(time.perf_counter() - started) * 1000.0,
                     tokens=len(text_ids),
                     draft=stats,
@@ -720,6 +728,16 @@ def decode_token_ids(tokenizer: object, token_ids: list[int]) -> str:
         return str(tokenizer.decode(token_ids, skip_special_tokens=True))
     except TypeError:
         return str(tokenizer.decode(token_ids))
+
+
+def join_decoded_prefix_and_suffix(
+    tokenizer: object,
+    prefix_ids: list[int],
+    suffix: str,
+) -> str:
+    if not prefix_ids:
+        return suffix
+    return decode_token_ids(tokenizer, prefix_ids) + suffix
 
 
 def tensor_to_ids(value: torch.Tensor | list[torch.Tensor]) -> list[int]:
