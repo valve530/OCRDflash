@@ -158,6 +158,7 @@ class DraftVerificationStats:
     chunk_size: int
     reference_matches: int = 0
     reference_misses: int = 0
+    bridge_tokens: int = 0
 
 
 @dataclass(slots=True)

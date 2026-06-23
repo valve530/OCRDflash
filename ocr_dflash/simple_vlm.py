@@ -26,11 +26,11 @@ PROMPTS = {
     "seal": "Seal Recognition:",
 }
 
-DEBUG_IMAGE = Path("tmp/simple_dflash_run4/page_0000/crops/block_0001.png")
+DEBUG_IMAGE = Path("tmp/simple_dflash_run4/page_0000/crops/block_0010.png")
 DEBUG_MODEL = Path("models/PaddleOCR-VL-1.6")
-DEBUG_TASK = "doc_title"
+DEBUG_TASK = "text"
 DEBUG_MODE = "dflash"
-DEBUG_DRAFT = "Attention is All You Need"
+DEBUG_DRAFT = "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks that include an encoder and a decoder.The best performing models also connect the encoder and decoder through an attention mechanism.We propose a new simple network architecture,the Transformer,based solely on attention mechanisms,dispensing with recurrence and convolutions entirely.Experiments on two machine translation tasks show these models to be superior in quality while being more parallelizable and requiring signiﬁcantly less time to train.Our model achieves 28.4 BLEU on the WMT 2014 English-to-German translation task,improving over the existing best results,including ensembles,by over 2 BLEU.On the WMT 2014 English-to-French translation task,our model establishes a new single-model state-of-the-art BLEU score of 41.0 after training for 3.5 days on eight GPUs,a small fraction of the training costs of the best models from the literature."
 DEFAULT_REFERENCE_WINDOW = 3
 MIN_REFERENCE_WINDOW = 2
 MAX_REFERENCE_MISSES = 2
@@ -126,7 +126,10 @@ class PaddleOCRVLRunner:
         started = time.perf_counter()
         inputs = self.inputs(image, task)
         with torch.no_grad():
-            outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens)
+            outputs = self.model.generate(
+                **inputs,
+                **greedy_generation_kwargs(max_new_tokens),
+            )
         generated_ids = outputs[0][inputs["input_ids"].shape[-1] :]
         text = self.processor.decode(generated_ids, skip_special_tokens=True).strip()
         return VlmResult(
@@ -164,6 +167,7 @@ class PaddleOCRVLRunner:
         output_ids: list[int] = []
         reference_matches = 0
         reference_misses = 0
+        bridge_tokens = 0
         with torch.no_grad():
             try:
                 logits, cache = self._prefill(inputs)
@@ -178,7 +182,7 @@ class PaddleOCRVLRunner:
                     )
                     if not chunk:
                         break
-                    chunk_outputs = self._forward_ids(chunk, cache, inputs["input_ids"])
+                    chunk_outputs = self._forward_ids(chunk, cache, inputs)
                     predicted = chunk_predictions(logits, chunk_outputs.logits)
                     matched = 0
                     for actual, expected in zip(predicted, chunk):
@@ -190,12 +194,23 @@ class PaddleOCRVLRunner:
                     if matched:
                         output_ids.extend(chunk[:matched])
                         accepted += matched
-                        draft_pos = find_after_subsequence(draft_ids, output_ids) or (
-                            draft_pos + matched
-                        )
+                        draft_pos = min(len(draft_ids), draft_pos + matched)
                     if matched == len(chunk):
                         logits = chunk_outputs.logits
                         cache = chunk_outputs.past_key_values
+                        continue
+                    if matched:
+                        logits, cache = self._prefill_from_output_ids(inputs, output_ids)
+
+                    actual = int(predicted[matched])
+                    expected = int(chunk[matched])
+                    if can_bridge_token_mismatch(self.tokenizer, actual, expected):
+                        output_ids.append(actual)
+                        checked += 1
+                        bridge_tokens += 1
+                        draft_pos = min(len(draft_ids), draft_pos + 1)
+                        logits, cache = self._prefill_from_output_ids(inputs, output_ids)
+                        reference_misses = 0
                         continue
 
                     aligned_pos = find_reference_position(
@@ -227,6 +242,7 @@ class PaddleOCRVLRunner:
                                 chunk_size=max(1, chunk_size),
                                 reference_matches=reference_matches,
                                 reference_misses=reference_misses,
+                                bridge_tokens=bridge_tokens,
                             )
                             return VlmResult(
                                 text=join_decoded_prefix_and_suffix(
@@ -265,6 +281,7 @@ class PaddleOCRVLRunner:
                             chunk_size=max(1, chunk_size),
                             reference_matches=reference_matches,
                             reference_misses=reference_misses,
+                            bridge_tokens=bridge_tokens,
                         )
                         return VlmResult(
                             text=join_decoded_prefix_and_suffix(
@@ -278,8 +295,11 @@ class PaddleOCRVLRunner:
                             draft=stats,
                         )
 
-                fully_accepted = accepted == len(draft_ids) and output_ids == draft_ids
-                if not fully_accepted and len(output_ids) < max_new_tokens:
+                draft_consumed = draft_pos >= len(draft_ids)
+                fully_accepted = (
+                    draft_consumed and bridge_tokens == 0 and output_ids == draft_ids
+                )
+                if not draft_consumed and len(output_ids) < max_new_tokens:
                     suffix_ids, suffix = self._generate_suffix(
                         inputs,
                         output_ids,
@@ -298,6 +318,11 @@ class PaddleOCRVLRunner:
                     )
                     generated_tokens = 0
 
+                rejected_tokens = (
+                    0
+                    if draft_consumed
+                    else max(0, len(draft_ids) - accepted - bridge_tokens)
+                )
                 stats = DraftVerificationStats(
                     mode="dflash_llma_reference",
                     accepted=fully_accepted,
@@ -306,14 +331,13 @@ class PaddleOCRVLRunner:
                     checked_tokens=checked,
                     matched_tokens=accepted,
                     accepted_tokens=accepted,
-                    rejected_tokens=0
-                    if fully_accepted
-                    else max(0, len(draft_ids) - accepted),
+                    rejected_tokens=rejected_tokens,
                     rollback_tokens=reference_misses,
                     generated_tokens=generated_tokens,
                     chunk_size=max(1, chunk_size),
                     reference_matches=reference_matches,
                     reference_misses=reference_misses,
+                    bridge_tokens=bridge_tokens,
                 )
                 return VlmResult(
                     text=text,
@@ -380,7 +404,7 @@ class PaddleOCRVLRunner:
                     generated_inputs = append_token_ids(inputs, draft_ids[:accepted])
                     outputs = self.model.generate(
                         **generation_inputs(generated_inputs),
-                        max_new_tokens=max_new_tokens,
+                        **greedy_generation_kwargs(max_new_tokens),
                     )
                     generated_ids = trim_prompt_ids(outputs, generated_inputs)[0]
                     text = decode_token_ids(
@@ -439,7 +463,10 @@ class PaddleOCRVLRunner:
         max_new_tokens: int,
     ) -> tuple[object, str]:
         generated_inputs = append_token_ids(inputs, prefix_ids)
-        outputs = self.model.generate(**generated_inputs, max_new_tokens=max_new_tokens)
+        outputs = self.model.generate(
+            **generated_inputs,
+            **greedy_generation_kwargs(max_new_tokens),
+        )
         suffix_ids = trim_prompt_ids(outputs, generated_inputs)[0]
         suffix = decode_token_ids(self.tokenizer, tensor_to_ids(suffix_ids))
         return suffix_ids, suffix
@@ -448,16 +475,34 @@ class PaddleOCRVLRunner:
         outputs = self.model(**inputs, use_cache=True, logits_to_keep=1)
         return outputs.logits, outputs.past_key_values
 
-    def _forward_ids(self, token_ids: list[int], cache: object, like: object):
+    def _prefill_from_output_ids(
+        self,
+        inputs: dict[str, object],
+        output_ids: list[int],
+    ):
+        prefixed_inputs = append_token_ids(inputs, output_ids)
+        outputs = self.model(**prefixed_inputs, use_cache=True, logits_to_keep=1)
+        return outputs.logits, outputs.past_key_values
+
+    def _forward_ids(self, token_ids: list[int], cache: object, inputs: dict[str, object]):
+        cache_len = cache_seq_length(cache)
+        input_ids = tensor_from_ids(token_ids, inputs["input_ids"])
         return self.model(
-            input_ids=tensor_from_ids(token_ids, like),
+            input_ids=input_ids,
             past_key_values=cache,
+            attention_mask=incremental_attention_mask(inputs, cache_len, len(token_ids)),
+            cache_position=torch.arange(
+                cache_len,
+                cache_len + len(token_ids),
+                dtype=torch.long,
+                device=input_ids.device,
+            ),
             use_cache=True,
             logits_to_keep=len(token_ids),
         )
 
-    def _decode_one(self, token_id: int, cache: object, like: object):
-        outputs = self._forward_ids([token_id], cache, like)
+    def _decode_one(self, token_id: int, cache: object, inputs: dict[str, object]):
+        outputs = self._forward_ids([token_id], cache, inputs)
         return outputs.logits, outputs.past_key_values
 
     def _continue_greedy(
@@ -465,7 +510,7 @@ class PaddleOCRVLRunner:
         logits: object,
         cache: object,
         max_new_tokens: int,
-        like: object,
+        inputs: dict[str, object],
     ) -> list[int]:
 
         generated: list[int] = []
@@ -476,7 +521,7 @@ class PaddleOCRVLRunner:
             if is_eos(self.model, token):
                 break
             generated.append(token)
-            current_logits, current_cache = self._decode_one(token, current_cache, like)
+            current_logits, current_cache = self._decode_one(token, current_cache, inputs)
         return generated
 
 
@@ -591,8 +636,8 @@ def reference_chunk(
     window: int,
 ) -> list[int]:
     chunk_size = max(1, chunk_size)
-    if not output_ids:
-        return draft_ids[:chunk_size]
+    if draft_pos < len(draft_ids):
+        return draft_ids[draft_pos : draft_pos + chunk_size]
 
     aligned_pos = find_reference_position(draft_ids, output_ids, window)
     start = aligned_pos if aligned_pos is not None else draft_pos
@@ -654,6 +699,26 @@ def decode_piece(tokenizer: object, token_id: int) -> str:
         return str(tokenizer.decode([token_id]))
 
 
+def can_bridge_token_mismatch(tokenizer: object, actual_id: int, expected_id: int) -> bool:
+    actual = normalize_bridge_piece(decode_piece(tokenizer, actual_id))
+    expected = normalize_bridge_piece(decode_piece(tokenizer, expected_id))
+    return bool(actual and expected and actual == expected)
+
+
+def normalize_bridge_piece(piece: str) -> str:
+    piece = unicodedata.normalize("NFKC", piece)
+    piece = (
+        piece.replace("∗", "*")
+        .replace(r"\(^{*}\)", "*")
+        .replace(r"^{*}", "*")
+        .replace("†", "dagger")
+        .replace(r"\(^{\dagger}\)", "dagger")
+        .replace("‡", "ddagger")
+        .replace(r"\(^{\ddagger}\)", "ddagger")
+    )
+    return "".join(ch for ch in piece.casefold() if not ch.isspace())
+
+
 def chunk_predictions(prefix_logits: object, chunk_logits: object) -> list[int]:
 
     first = torch.argmax(prefix_logits[:, -1, :], dim=-1).reshape(1)
@@ -671,6 +736,22 @@ def cache_seq_length(cache: object) -> int:
         return int(cache[0][0].shape[-2])
     except Exception:
         return 0
+
+
+def incremental_attention_mask(
+    inputs: dict[str, object], cache_len: int, current_len: int
+) -> object | None:
+    base_mask = inputs.get("attention_mask")
+    if base_mask is None:
+        return None
+    mask = torch.ones(
+        (base_mask.shape[0], cache_len + current_len),
+        dtype=base_mask.dtype,
+        device=base_mask.device,
+    )
+    prefix_len = min(cache_len, base_mask.shape[-1])
+    mask[:, :prefix_len] = base_mask[:, :prefix_len]
+    return mask
 
 
 def crop_cache(cache: object, max_length: int) -> None:
@@ -719,6 +800,14 @@ def trim_prompt_ids(output_ids: object, inputs: dict[str, object]) -> object:
 
 def generation_inputs(inputs: dict[str, object]) -> dict[str, object]:
     return dict(inputs)
+
+
+def greedy_generation_kwargs(max_new_tokens: int) -> dict[str, object]:
+    return {
+        "max_new_tokens": max(1, int(max_new_tokens)),
+        "do_sample": False,
+        "num_beams": 1,
+    }
 
 
 def decode_token_ids(tokenizer: object, token_ids: list[int]) -> str:
@@ -789,7 +878,7 @@ def main() -> None:
     parser.add_argument("--mode", choices=["baseline", "dflash"], default=DEBUG_MODE)
     parser.add_argument("--draft", default=DEBUG_DRAFT)
     parser.add_argument("--draft-file", type=Path)
-    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--chunk-size", type=int, default=8)
     parser.add_argument("--max-pixels", type=int, default=1280 * 28 * 28)
     parser.add_argument("--device", default="cuda")
